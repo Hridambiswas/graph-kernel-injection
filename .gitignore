@@ -1,0 +1,24 @@
+# byte-code / packaging
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# profiler artefacts
+traces/
+*.ptrace
+*.pt.trace.json
+
+# benchmark outputs
+bench_results.csv
+
+# editor / OS cruft
+.vscode/
+.idea/
+.DS_Store
+
+# triton cache
+.triton/
