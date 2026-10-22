@@ -166,9 +166,13 @@ def verify_forward_correctness(cfg: HarnessConfig) -> int:
         mask = _make_mask(small)
         tri = block_sparse_attention(
             q, k, v, mask, block_m=small.block_m, block_n=small.block_n,
+            is_causal=True, sink_size=small.sink_size,
+            window_size=small.window_size,
         )
         ref = reference_block_sparse_attention(
             q, k, v, mask, block_m=small.block_m, block_n=small.block_n,
+            is_causal=True, sink_size=small.sink_size,
+            window_size=small.window_size,
         )
         max_abs = (tri - ref).abs().max().item()
         max_rel = ((tri - ref).abs() / ref.abs().clamp_min(1e-6)).max().item()
@@ -189,17 +193,19 @@ def verify_forward_correctness(cfg: HarnessConfig) -> int:
 
 def _gradcheck_fn(
     mask: torch.Tensor, scale: float, block_m: int, block_n: int,
+    sink_size: int, window_size: int,
 ) -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
     """Partial-applied kernel suitable for :func:`torch.autograd.gradcheck`.
 
     gradcheck requires a function whose only autograd-tracked inputs
-    are tensors; the block mask and the scale factor are frozen in a
-    closure.
+    are tensors; the block mask, scale factor and token-level
+    StreamingLLM parameters are frozen in a closure.
     """
     def inner(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         return block_sparse_attention(
             q, k, v, mask, softmax_scale=scale,
             block_m=block_m, block_n=block_n,
+            is_causal=True, sink_size=sink_size, window_size=window_size,
         )
     return inner
 
@@ -227,6 +233,7 @@ def _run_gradchecks(
     mask = _make_mask(tiny)
     fn = _gradcheck_fn(
         mask, 1.0 / math.sqrt(tiny.head_dim), tiny.block_m, tiny.block_n,
+        tiny.sink_size, tiny.window_size,
     )
     print(
         f"[gradcheck] dtype={dtype}, shape=(B={tiny.batch}, H={tiny.heads}, "
@@ -308,9 +315,11 @@ def verify_gradients(cfg: HarnessConfig) -> int:
 
     out_tri = block_sparse_attention(
         q, k, v, mask, block_m=mid.block_m, block_n=mid.block_n,
+        is_causal=True, sink_size=mid.sink_size, window_size=mid.window_size,
     )
     out_ref = reference_block_sparse_attention(
         q_ref, k_ref, v_ref, mask, block_m=mid.block_m, block_n=mid.block_n,
+        is_causal=True, sink_size=mid.sink_size, window_size=mid.window_size,
     )
     g = torch.randn_like(out_tri)
     (out_tri * g).sum().backward()
@@ -449,6 +458,7 @@ def _eager_fn(
         return reference_block_sparse_attention(
             q, k, v, mask, softmax_scale=scale,
             block_m=cfg.block_m, block_n=cfg.block_n,
+            is_causal=True, sink_size=cfg.sink_size, window_size=cfg.window_size,
         )
     return fn
 
@@ -462,6 +472,7 @@ def _triton_fn(
         return block_sparse_attention(
             q, k, v, mask, softmax_scale=scale,
             block_m=cfg.block_m, block_n=cfg.block_n,
+            is_causal=True, sink_size=cfg.sink_size, window_size=cfg.window_size,
         )
     return fn
 

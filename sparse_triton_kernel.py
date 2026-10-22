@@ -218,6 +218,7 @@ if _TRITON_AVAILABLE:
         Q, K, V, Out, Lse,
         BlockMask,
         softmax_scale,
+        sink_size, window_size,
         stride_qz, stride_qh, stride_qm, stride_qd,
         stride_kz, stride_kh, stride_kn, stride_kd,
         stride_vz, stride_vh, stride_vn, stride_vd,
@@ -229,6 +230,7 @@ if _TRITON_AVAILABLE:
         BLOCK_N: tl.constexpr,
         HEAD_DIM: tl.constexpr,
         NUM_KV_BLOCKS: tl.constexpr,
+        IS_CAUSAL: tl.constexpr,
     ):
         """Block-sparse Flash-Attention forward kernel.
 
@@ -281,9 +283,22 @@ if _TRITON_AVAILABLE:
                 k = tl.load(k_ptrs, mask=kv_mask[None, :], other=0.0)
                 v = tl.load(v_ptrs, mask=kv_mask[:, None], other=0.0)
 
-                # --- QK^T and (optional) causal fix inside the block ---
+                # --- QK^T and (optional) in-block token-level mask ---
+                # Block-level sparsity selects *which* (q_block, k_block)
+                # pairs are visited; inside a visited pair we still have
+                # to apply the token-level StreamingLLM mask, otherwise
+                # diagonal / near-window-edge blocks let tokens see the
+                # future (fix H-1 from docs/architecture_notes.md).
                 qk = tl.dot(q, k) * softmax_scale  # [BLOCK_M, BLOCK_N]
-                qk = tl.where(kv_mask[None, :], qk, float("-inf"))
+                k_pos = kv_off + offs_n           # [BLOCK_N]
+                if IS_CAUSAL:
+                    sink = k_pos < sink_size                                   # [BLOCK_N]
+                    causal = k_pos[None, :] <= offs_m[:, None]                 # [M, N]
+                    windowed = k_pos[None, :] >= (offs_m[:, None] - window_size + 1)
+                    token_mask = sink[None, :] | (causal & windowed)
+                    qk = tl.where(kv_mask[None, :] & token_mask, qk, float("-inf"))
+                else:
+                    qk = tl.where(kv_mask[None, :], qk, float("-inf"))
 
                 # Online softmax (FlashAttention-2 numerics):
                 #   m_new = max(m_old, max_j(qk))
@@ -357,6 +372,7 @@ if _TRITON_AVAILABLE:
         Q, K, V, DO, DK, DV, Lse, Delta,
         BlockMask,
         softmax_scale,
+        sink_size, window_size,
         stride_qz, stride_qh, stride_qm, stride_qd,
         stride_kz, stride_kh, stride_kn, stride_kd,
         stride_vz, stride_vh, stride_vn, stride_vd,
@@ -371,6 +387,7 @@ if _TRITON_AVAILABLE:
         BLOCK_N: tl.constexpr,
         HEAD_DIM: tl.constexpr,
         NUM_Q_BLOCKS: tl.constexpr,
+        IS_CAUSAL: tl.constexpr,
     ):
         """Backward pass computing :math:`\\partial K`, :math:`\\partial V`.
 
@@ -426,9 +443,21 @@ if _TRITON_AVAILABLE:
                     delta_base + (q_off + offs_m) * stride_dltm, mask=qm, other=0.0
                 )
 
-                # Recompute P (not stashed) exactly as the forward did.
+                # Recompute P (not stashed) exactly as the forward did —
+                # must apply the identical in-block token mask or the
+                # bwd will leak gradients through forbidden pairs.
                 qk = tl.dot(q, tl.trans(k)) * softmax_scale
-                qk = tl.where(qm[:, None] & mask_n[None, :], qk, float("-inf"))
+                q_pos = q_off + offs_m   # [BLOCK_M] — absolute q position
+                # offs_n here already equals (pid_n * BLOCK_N + arange),
+                # i.e. absolute k position, so no further offset is needed.
+                if IS_CAUSAL:
+                    sink = offs_n < sink_size
+                    causal = offs_n[None, :] <= q_pos[:, None]
+                    windowed = offs_n[None, :] >= (q_pos[:, None] - window_size + 1)
+                    token_mask = sink[None, :] | (causal & windowed)
+                    qk = tl.where(qm[:, None] & mask_n[None, :] & token_mask, qk, float("-inf"))
+                else:
+                    qk = tl.where(qm[:, None] & mask_n[None, :], qk, float("-inf"))
                 p = tl.exp(qk - lse[:, None])
 
                 # dV += P^T @ dO  (reduce over Q within this block)
@@ -457,6 +486,7 @@ if _TRITON_AVAILABLE:
         Q, K, V, DO, DQ, Lse, Delta,
         BlockMask,
         softmax_scale,
+        sink_size, window_size,
         stride_qz, stride_qh, stride_qm, stride_qd,
         stride_kz, stride_kh, stride_kn, stride_kd,
         stride_vz, stride_vh, stride_vn, stride_vd,
@@ -470,6 +500,7 @@ if _TRITON_AVAILABLE:
         BLOCK_N: tl.constexpr,
         HEAD_DIM: tl.constexpr,
         NUM_KV_BLOCKS: tl.constexpr,
+        IS_CAUSAL: tl.constexpr,
     ):
         """Backward pass computing :math:`\\partial Q`.
 
@@ -521,7 +552,15 @@ if _TRITON_AVAILABLE:
                 v = tl.load(v_ptrs, mask=kvn[:, None], other=0.0)
 
                 qk = tl.dot(q, tl.trans(k)) * softmax_scale
-                qk = tl.where(mask_m[:, None] & kvn[None, :], qk, float("-inf"))
+                k_pos = kv_off + offs_n   # [BLOCK_N] — absolute k position
+                if IS_CAUSAL:
+                    sink = k_pos < sink_size
+                    causal = k_pos[None, :] <= offs_m[:, None]
+                    windowed = k_pos[None, :] >= (offs_m[:, None] - window_size + 1)
+                    token_mask = sink[None, :] | (causal & windowed)
+                    qk = tl.where(mask_m[:, None] & kvn[None, :] & token_mask, qk, float("-inf"))
+                else:
+                    qk = tl.where(mask_m[:, None] & kvn[None, :], qk, float("-inf"))
                 p = tl.exp(qk - lse[:, None])
                 dp = tl.dot(do, tl.trans(v))
                 ds = p * (dp - delta[:, None]) * softmax_scale
@@ -552,6 +591,9 @@ class _BlockSparseFlashAttention(torch.autograd.Function):
         softmax_scale: float,
         block_m: int,
         block_n: int,
+        is_causal: bool,
+        sink_size: int,
+        window_size: int,
     ) -> torch.Tensor:
         if not _TRITON_AVAILABLE:
             raise RuntimeError(
@@ -587,6 +629,7 @@ class _BlockSparseFlashAttention(torch.autograd.Function):
             q, k, v, o, lse,
             block_mask,
             softmax_scale,
+            int(sink_size), int(window_size),
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
@@ -598,6 +641,7 @@ class _BlockSparseFlashAttention(torch.autograd.Function):
             BLOCK_N=block_n,
             HEAD_DIM=D,
             NUM_KV_BLOCKS=n_kb,
+            IS_CAUSAL=bool(is_causal),
             num_warps=4,
             num_stages=2,
         )
@@ -606,6 +650,9 @@ class _BlockSparseFlashAttention(torch.autograd.Function):
         ctx.softmax_scale = softmax_scale
         ctx.block_m = block_m
         ctx.block_n = block_n
+        ctx.is_causal = bool(is_causal)
+        ctx.sink_size = int(sink_size)
+        ctx.window_size = int(window_size)
         return o
 
     @staticmethod
@@ -616,6 +663,9 @@ class _BlockSparseFlashAttention(torch.autograd.Function):
         softmax_scale: float = ctx.softmax_scale
         block_m: int = ctx.block_m
         block_n: int = ctx.block_n
+        is_causal: bool = ctx.is_causal
+        sink_size: int = ctx.sink_size
+        window_size: int = ctx.window_size
 
         do = do.contiguous()
         B, H, N_Q, D = q.shape
@@ -645,6 +695,7 @@ class _BlockSparseFlashAttention(torch.autograd.Function):
             q, k, v, do, dk, dv, lse, delta,
             block_mask,
             softmax_scale,
+            int(sink_size), int(window_size),
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
@@ -659,6 +710,7 @@ class _BlockSparseFlashAttention(torch.autograd.Function):
             BLOCK_N=block_n,
             HEAD_DIM=D,
             NUM_Q_BLOCKS=n_qb,
+            IS_CAUSAL=is_causal,
             num_warps=4,
             num_stages=2,
         )
@@ -668,6 +720,7 @@ class _BlockSparseFlashAttention(torch.autograd.Function):
             q, k, v, do, dq, lse, delta,
             block_mask,
             softmax_scale,
+            int(sink_size), int(window_size),
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
@@ -681,11 +734,12 @@ class _BlockSparseFlashAttention(torch.autograd.Function):
             BLOCK_N=block_n,
             HEAD_DIM=D,
             NUM_KV_BLOCKS=n_kb,
+            IS_CAUSAL=is_causal,
             num_warps=4,
             num_stages=2,
         )
 
-        return dq, dk, dv, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -701,6 +755,9 @@ def block_sparse_attention(
     softmax_scale: Optional[float] = None,
     block_m: int = 64,
     block_n: int = 64,
+    is_causal: bool = False,
+    sink_size: int = 0,
+    window_size: int = 0,
 ) -> torch.Tensor:
     """Differentiable block-sparse Flash-Attention.
 
@@ -712,22 +769,29 @@ def block_sparse_attention(
         ``{16, 32, 64, 128}`` for best codegen.
     block_mask:
         Shape ``[n_q_blocks, n_kv_blocks]``, dtype coercible to int32.
+        Visited iff the entry is non-zero; a visited block *still*
+        receives the in-block token-level mask when ``is_causal=True``.
     softmax_scale:
         Logit scale. Defaults to :math:`1 / \\sqrt{D}`.
     block_m, block_n:
         Row/column tile sizes. Must divide the sequence lengths.
-
-    Returns
-    -------
-    torch.Tensor
-        Output tensor of shape ``[batch, heads, seq_q, head_dim]`` with
-        the same dtype as ``q``.
+    is_causal:
+        If ``True``, enforces the StreamingLLM token-level mask
+        ``(k_pos < sink_size) | ((k_pos <= q_pos) & (k_pos >=
+        q_pos - window_size + 1))`` inside every visited block. This
+        is required for causal / sliding-window / StreamingLLM
+        semantics; without it, diagonal blocks let tokens see the
+        future (fix H-1 from docs/architecture_notes.md).
+    sink_size, window_size:
+        Token-level StreamingLLM parameters. Only consulted when
+        ``is_causal=True``.
     """
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
     return _BlockSparseFlashAttention.apply(
         q.contiguous(), k.contiguous(), v.contiguous(),
         block_mask, float(softmax_scale), int(block_m), int(block_n),
+        bool(is_causal), int(sink_size), int(window_size),
     )
 
 
@@ -744,32 +808,77 @@ def reference_block_sparse_attention(
     softmax_scale: Optional[float] = None,
     block_m: int = 64,
     block_n: int = 64,
+    is_causal: bool = False,
+    sink_size: int = 0,
+    window_size: int = 0,
 ) -> torch.Tensor:
     """Pure-PyTorch reference for :func:`block_sparse_attention`.
 
     Materialises the full :math:`[N_Q, N_{KV}]` logit matrix with
-    :math:`-\\infty` outside the mask, then calls softmax. This is
-    :math:`\\Theta(N^2)` memory and only exists for correctness checks
+    :math:`-\\infty` outside the mask, then calls softmax.
+    :math:`\\Theta(N^2)` memory; only exists for correctness checks
     against the Triton kernel on small inputs.
+
+    The effective mask is ``block_mask_lifted_to_tokens AND token_mask``,
+    where ``token_mask`` is the token-level StreamingLLM mask when
+    ``is_causal=True`` (fix H-2 from docs/architecture_notes.md: the
+    oracle must apply the same in-block token mask as the kernel, or
+    gradcheck validates like-with-like against the wrong semantics).
     """
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
 
     B, H, N_Q, D = q.shape
     _, _, N_KV, _ = k.shape
-    n_qb, n_kb = block_mask.shape
 
-    # Expand block-level mask to token-level [N_Q, N_KV].
-    token_mask = block_mask.to(torch.bool).repeat_interleave(block_m, dim=0)
-    token_mask = token_mask.repeat_interleave(block_n, dim=1)
-    token_mask = token_mask[:N_Q, :N_KV]
+    # Lift block-level mask to token level.
+    lifted = block_mask.to(torch.bool).repeat_interleave(block_m, dim=0)
+    lifted = lifted.repeat_interleave(block_n, dim=1)
+    lifted = lifted[:N_Q, :N_KV]
+
+    if is_causal:
+        q_pos = torch.arange(N_Q, device=q.device)
+        k_pos = torch.arange(N_KV, device=q.device)
+        sink = k_pos[None, :] < sink_size
+        causal = k_pos[None, :] <= q_pos[:, None]
+        windowed = k_pos[None, :] >= (q_pos[:, None] - window_size + 1)
+        in_block = sink | (causal & windowed)
+        effective = lifted & in_block
+    else:
+        effective = lifted
 
     scores = torch.matmul(q, k.transpose(-2, -1)) * softmax_scale  # [B,H,N_Q,N_KV]
-    scores = scores.masked_fill(~token_mask, float("-inf"))
+    scores = scores.masked_fill(~effective, float("-inf"))
     probs = torch.softmax(scores, dim=-1)
-    # Guard against all-masked rows (shouldn't happen for StreamingLLM).
     probs = torch.nan_to_num(probs, nan=0.0)
     return torch.matmul(probs, v)
+
+
+def streaming_token_mask(
+    n_q: int, n_kv: int, sink_size: int, window_size: int,
+    device: torch.device | str = "cpu",
+) -> torch.Tensor:
+    """Return the exact token-level StreamingLLM mask.
+
+    Shape ``[n_q, n_kv]``, dtype bool. ``True`` iff the (q, k) token
+    pair is attended to under the paper's definition:
+
+    .. math::
+
+        \\mathcal{A}(q) \\;=\\;
+        \\{k : k < S\\} \\;\\cup\\; \\{k : q - W + 1 \\le k \\le q\\}
+
+    Independent of any block-level mask. Used by the correctness test
+    in :file:`tests/test_mask_equivalence.py` to assert that the
+    effective mask the kernel applies (block gate ∩ in-block token
+    mask) equals this pure definition.
+    """
+    q_pos = torch.arange(n_q, device=device)
+    k_pos = torch.arange(n_kv, device=device)
+    sink = k_pos[None, :] < sink_size
+    causal = k_pos[None, :] <= q_pos[:, None]
+    windowed = k_pos[None, :] >= (q_pos[:, None] - window_size + 1)
+    return sink | (causal & windowed)
 
 
 __all__ = [
@@ -778,4 +887,5 @@ __all__ = [
     "make_dense_mask",
     "make_streaming_mask",
     "reference_block_sparse_attention",
+    "streaming_token_mask",
 ]
