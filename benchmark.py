@@ -525,12 +525,19 @@ def _flex_fn(
     sink, window = cfg.sink_size, cfg.window_size
     n_q = q.shape[-2]
     n_kv = k.shape[-2]
+    # Bottom-right alignment to match the kernel / oracle convention
+    # (prompt 004 bug B): FlexAttention mask_mod receives (q_idx,
+    # kv_idx) as 0-indexed positions into their own tensors; we lift
+    # q_idx into the KV coordinate frame.
+    q_offset = n_kv - n_q
 
     def mask_mod(b, h, q_idx, kv_idx):  # noqa: ARG001 — unused b/h required by API
+        q_abs = q_idx + q_offset
         is_sink = kv_idx < sink
-        is_causal = kv_idx <= q_idx
-        is_window = kv_idx >= q_idx - window + 1
-        return is_sink | (is_causal & is_window)
+        is_causal = kv_idx <= q_abs
+        is_window = kv_idx >= q_abs - window + 1
+        # Correct formula (prompt 004 bug A): causal & (sink | window).
+        return is_causal & (is_sink | is_window)
 
     block_mask = _flex_create_block_mask(
         mask_mod, B=None, H=None, Q_LEN=n_q, KV_LEN=n_kv, device=str(q.device),
