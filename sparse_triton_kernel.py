@@ -111,15 +111,27 @@ def make_streaming_mask(
 ) -> torch.Tensor:
     """Build the block-level StreamingLLM sparsity mask.
 
-    A block pair :math:`(i, j)` is kept iff some query token in query
-    block :math:`i` attends to some key token in key block :math:`j`
-    under the token-level StreamingLLM pattern (sink ∪ causal window).
+    A block pair :math:`(i, j)` is kept iff **some** query token in
+    query block :math:`i` is allowed to attend to **some** key token in
+    key block :math:`j` under the paper's token-level rule
+
+    .. math::
+
+        \\text{visible}(q, k) \\;=\\; (k \\le q) \\;\\wedge\\;
+        \\bigl( k < S \\;\\vee\\; k \\ge q - W + 1 \\bigr).
+
+    Queries are **bottom-right aligned** to the KV cache, i.e. the
+    :math:`N_Q` query positions live at absolute positions
+    :math:`[N_{KV}-N_Q,\\, N_{KV})` — matching how FlashAttention and
+    FlexAttention are driven when a KV cache is in play.
 
     Parameters
     ----------
     n_q, n_kv:
-        Token-level query and key sequence lengths. Must satisfy
-        ``n_q % block_m == 0`` and ``n_kv % block_n == 0``.
+        Token-level query and key sequence lengths. Need **not** be
+        multiples of ``block_m`` / ``block_n`` — the mask uses ceiling
+        division to match the autograd bridge, and the kernel bounds-
+        checks the partial edge block.
     spec:
         The StreamingLLM parameters (sink + window).
     block_m, block_n:
@@ -130,39 +142,42 @@ def make_streaming_mask(
     Returns
     -------
     torch.Tensor
-        An ``int32`` tensor of shape ``[n_q // block_m, n_kv // block_n]``
-        whose entries are 1 for "attend" and 0 for "skip".
+        An ``int32`` tensor of shape
+        ``[ceil(n_q / block_m), ceil(n_kv / block_n)]`` whose entries are
+        1 for "attend" and 0 for "skip".
 
     Complexity
     ----------
     :math:`O(n_q n_{kv} / (B_M B_N))` ops; no materialisation of the
     :math:`[n_q, n_{kv}]` dense mask.
     """
-    if n_q % block_m != 0:
-        raise ValueError(f"n_q ({n_q}) must be a multiple of block_m ({block_m})")
-    if n_kv % block_n != 0:
-        raise ValueError(f"n_kv ({n_kv}) must be a multiple of block_n ({block_n})")
+    if n_q <= 0 or n_kv <= 0:
+        raise ValueError("n_q and n_kv must be positive")
 
-    n_qb = n_q // block_m
-    n_kb = n_kv // block_n
+    # M-1 (prompt 004): ceiling division, same as the autograd bridge.
+    # Partial edge blocks are kept and the kernel bounds-checks tokens.
+    n_qb = (n_q + block_m - 1) // block_m
+    n_kb = (n_kv + block_n - 1) // block_n
 
-    # Compute the half-open token range covered by every block.
-    q_lo = torch.arange(n_qb, device=device) * block_m
+    # Bottom-right alignment (prompt 004 bug B): query positions sit at
+    # the last N_Q positions of the KV range.
+    q_offset = n_kv - n_q
+
+    # Absolute token ranges covered by every block (half-open).
+    q_lo = torch.arange(n_qb, device=device) * block_m + q_offset
     q_hi = q_lo + block_m  # exclusive
     k_lo = torch.arange(n_kb, device=device) * block_n
     k_hi = k_lo + block_n
 
-    # Sink: a key block j is a sink block iff k_lo[j] < sink_size.
-    sink = (k_lo[None, :] < spec.sink_size).expand(n_qb, n_kb)
+    # Block-level analogue of the token formula `causal & (sink | window)`.
+    # - causal_block : q_hi > k_lo              → ∃ (q,k) with q ≥ k
+    # - sink_block   : k_lo < S                 → block contains some sink
+    # - window_block : k_hi - 1 ≥ q_lo - W + 1 → block overlaps some window
+    causal_block = q_hi[:, None] > k_lo[None, :]
+    sink_block = (k_lo[None, :] < spec.sink_size).expand(n_qb, n_kb)
+    window_block = (k_hi[None, :] - 1) >= (q_lo[:, None] - spec.window_size + 1)
 
-    # Causal window: block j overlaps the window of some q in block i iff
-    #     k_lo[j]            <=   q_hi[i] - 1               (k <= q)
-    #     k_hi[j] - 1        >=   q_lo[i] - window_size + 1 (k >= q - W + 1)
-    causal_upper = k_lo[None, :] <= (q_hi[:, None] - 1)
-    causal_lower = (k_hi[None, :] - 1) >= (q_lo[:, None] - spec.window_size + 1)
-    window = causal_upper & causal_lower
-
-    mask = (sink | window).to(torch.int32)
+    mask = (causal_block & (sink_block | window_block)).to(torch.int32)
     return mask.contiguous()
 
 
@@ -218,6 +233,7 @@ if _TRITON_AVAILABLE:
         Q, K, V, Out, Lse,
         BlockMask,
         softmax_scale,
+        sink_size, window_size, q_offset,
         stride_qz, stride_qh, stride_qm, stride_qd,
         stride_kz, stride_kh, stride_kn, stride_kd,
         stride_vz, stride_vh, stride_vn, stride_vd,
@@ -229,6 +245,7 @@ if _TRITON_AVAILABLE:
         BLOCK_N: tl.constexpr,
         HEAD_DIM: tl.constexpr,
         NUM_KV_BLOCKS: tl.constexpr,
+        IS_CAUSAL: tl.constexpr,
     ):
         """Block-sparse Flash-Attention forward kernel.
 
@@ -281,9 +298,28 @@ if _TRITON_AVAILABLE:
                 k = tl.load(k_ptrs, mask=kv_mask[None, :], other=0.0)
                 v = tl.load(v_ptrs, mask=kv_mask[:, None], other=0.0)
 
-                # --- QK^T and (optional) causal fix inside the block ---
+                # --- QK^T and (optional) in-block token-level mask ---
+                # Block-level sparsity selects *which* (q_block, k_block)
+                # pairs are visited; inside a visited pair we apply the
+                # token-level StreamingLLM mask
+                #     causal AND (sink OR window)
+                # with q_pos bottom-right aligned to the KV cache
+                # (q_pos = (N_KV - N_Q) + offs_m). The old formula
+                # `sink OR (causal AND window)` let q < sink_size see
+                # future sink keys (prompt 004 bug A); the old q_pos =
+                # offs_m let a decode query at the end of the KV cache
+                # think it was at position 0 (bug B).
                 qk = tl.dot(q, k) * softmax_scale  # [BLOCK_M, BLOCK_N]
-                qk = tl.where(kv_mask[None, :], qk, float("-inf"))
+                k_pos = kv_off + offs_n           # [BLOCK_N]
+                q_pos = offs_m + q_offset         # [BLOCK_M]
+                if IS_CAUSAL:
+                    sink = k_pos < sink_size                                   # [BLOCK_N]
+                    causal = k_pos[None, :] <= q_pos[:, None]                  # [M, N]
+                    windowed = k_pos[None, :] >= (q_pos[:, None] - window_size + 1)
+                    token_mask = causal & (sink[None, :] | windowed)
+                    qk = tl.where(kv_mask[None, :] & token_mask, qk, float("-inf"))
+                else:
+                    qk = tl.where(kv_mask[None, :], qk, float("-inf"))
 
                 # Online softmax (FlashAttention-2 numerics):
                 #   m_new = max(m_old, max_j(qk))
@@ -298,10 +334,13 @@ if _TRITON_AVAILABLE:
                 m_i = m_ij
 
         # ---- epilogue: finalise softmax division and store ----
-        # If a query block is fully masked out (should not happen for a
-        # well-formed StreamingLLM mask) we would hit `l_i == 0`; guard
-        # against the division by zero.
-        safe_l = tl.where(l_i > 0.0, l_i, 1.0)
+        # A fully-masked row has l_i == 0 and m_i == -inf. Guard both
+        # so the output is a clean zero (not NaN from 0/0) and the
+        # stored LSE is a finite sentinel (not -inf → NaN in bwd via
+        # exp(-inf - -inf) = exp(NaN) = NaN).  M-2 fix (prompt 004).
+        row_valid = l_i > 0.0
+        safe_l = tl.where(row_valid, l_i, 1.0)
+        safe_m = tl.where(row_valid, m_i, 0.0)
         acc = acc / safe_l[:, None]
 
         o_ptrs = o_base + offs_m[:, None] * stride_om + offs_d[None, :] * stride_od
@@ -309,7 +348,7 @@ if _TRITON_AVAILABLE:
 
         # Log-sum-exp is cached for the backward pass.
         lse_ptrs = lse_base + offs_m * stride_lm
-        lse = m_i + tl.log(safe_l)
+        lse = safe_m + tl.log(safe_l)
         tl.store(lse_ptrs, lse, mask=offs_m < N_Q)
 
     @triton.jit
@@ -357,6 +396,7 @@ if _TRITON_AVAILABLE:
         Q, K, V, DO, DK, DV, Lse, Delta,
         BlockMask,
         softmax_scale,
+        sink_size, window_size, q_offset,
         stride_qz, stride_qh, stride_qm, stride_qd,
         stride_kz, stride_kh, stride_kn, stride_kd,
         stride_vz, stride_vh, stride_vn, stride_vd,
@@ -371,6 +411,7 @@ if _TRITON_AVAILABLE:
         BLOCK_N: tl.constexpr,
         HEAD_DIM: tl.constexpr,
         NUM_Q_BLOCKS: tl.constexpr,
+        IS_CAUSAL: tl.constexpr,
     ):
         """Backward pass computing :math:`\\partial K`, :math:`\\partial V`.
 
@@ -426,9 +467,24 @@ if _TRITON_AVAILABLE:
                     delta_base + (q_off + offs_m) * stride_dltm, mask=qm, other=0.0
                 )
 
-                # Recompute P (not stashed) exactly as the forward did.
+                # Recompute P (not stashed) exactly as the forward did —
+                # must apply the identical in-block token mask or the
+                # bwd will leak gradients through forbidden pairs. The
+                # mask uses the bottom-right-aligned q_pos (q_offset =
+                # N_KV - N_Q) and the formula `causal AND (sink OR
+                # window)` (prompt 004 bugs A, B).
                 qk = tl.dot(q, tl.trans(k)) * softmax_scale
-                qk = tl.where(qm[:, None] & mask_n[None, :], qk, float("-inf"))
+                q_pos = q_off + offs_m + q_offset   # [BLOCK_M] — absolute q
+                # offs_n here already equals (pid_n * BLOCK_N + arange),
+                # i.e. absolute k position, so no further offset is needed.
+                if IS_CAUSAL:
+                    sink = offs_n < sink_size
+                    causal = offs_n[None, :] <= q_pos[:, None]
+                    windowed = offs_n[None, :] >= (q_pos[:, None] - window_size + 1)
+                    token_mask = causal & (sink[None, :] | windowed)
+                    qk = tl.where(qm[:, None] & mask_n[None, :] & token_mask, qk, float("-inf"))
+                else:
+                    qk = tl.where(qm[:, None] & mask_n[None, :], qk, float("-inf"))
                 p = tl.exp(qk - lse[:, None])
 
                 # dV += P^T @ dO  (reduce over Q within this block)
@@ -457,6 +513,7 @@ if _TRITON_AVAILABLE:
         Q, K, V, DO, DQ, Lse, Delta,
         BlockMask,
         softmax_scale,
+        sink_size, window_size, q_offset,
         stride_qz, stride_qh, stride_qm, stride_qd,
         stride_kz, stride_kh, stride_kn, stride_kd,
         stride_vz, stride_vh, stride_vn, stride_vd,
@@ -470,6 +527,7 @@ if _TRITON_AVAILABLE:
         BLOCK_N: tl.constexpr,
         HEAD_DIM: tl.constexpr,
         NUM_KV_BLOCKS: tl.constexpr,
+        IS_CAUSAL: tl.constexpr,
     ):
         """Backward pass computing :math:`\\partial Q`.
 
@@ -521,7 +579,16 @@ if _TRITON_AVAILABLE:
                 v = tl.load(v_ptrs, mask=kvn[:, None], other=0.0)
 
                 qk = tl.dot(q, tl.trans(k)) * softmax_scale
-                qk = tl.where(mask_m[:, None] & kvn[None, :], qk, float("-inf"))
+                k_pos = kv_off + offs_n   # [BLOCK_N] — absolute k position
+                q_pos = offs_m + q_offset   # [BLOCK_M] — absolute q position
+                if IS_CAUSAL:
+                    sink = k_pos < sink_size
+                    causal = k_pos[None, :] <= q_pos[:, None]
+                    windowed = k_pos[None, :] >= (q_pos[:, None] - window_size + 1)
+                    token_mask = causal & (sink[None, :] | windowed)
+                    qk = tl.where(mask_m[:, None] & kvn[None, :] & token_mask, qk, float("-inf"))
+                else:
+                    qk = tl.where(mask_m[:, None] & kvn[None, :], qk, float("-inf"))
                 p = tl.exp(qk - lse[:, None])
                 dp = tl.dot(do, tl.trans(v))
                 ds = p * (dp - delta[:, None]) * softmax_scale
@@ -552,6 +619,9 @@ class _BlockSparseFlashAttention(torch.autograd.Function):
         softmax_scale: float,
         block_m: int,
         block_n: int,
+        is_causal: bool,
+        sink_size: int,
+        window_size: int,
     ) -> torch.Tensor:
         if not _TRITON_AVAILABLE:
             raise RuntimeError(
@@ -582,11 +652,19 @@ class _BlockSparseFlashAttention(torch.autograd.Function):
         o = torch.empty_like(q)
         lse = torch.empty((B, H, N_Q), dtype=torch.float32, device=q.device)
 
+        # Bottom-right aligned convention (FlashAttention / FlexAttention
+        # with a KV cache): the N_Q query positions live at the LAST
+        # N_Q positions of the KV range. Prompt 004 bug B — previously
+        # q_pos started at 0, which made a decode query attend to only
+        # the sink prefix and fake a huge speedup.
+        q_offset = N_KV - N_Q
+
         grid = (n_qb, B * H)
         _fwd_kernel[grid](
             q, k, v, o, lse,
             block_mask,
             softmax_scale,
+            int(sink_size), int(window_size), int(q_offset),
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
@@ -598,6 +676,7 @@ class _BlockSparseFlashAttention(torch.autograd.Function):
             BLOCK_N=block_n,
             HEAD_DIM=D,
             NUM_KV_BLOCKS=n_kb,
+            IS_CAUSAL=bool(is_causal),
             num_warps=4,
             num_stages=2,
         )
@@ -606,6 +685,10 @@ class _BlockSparseFlashAttention(torch.autograd.Function):
         ctx.softmax_scale = softmax_scale
         ctx.block_m = block_m
         ctx.block_n = block_n
+        ctx.is_causal = bool(is_causal)
+        ctx.sink_size = int(sink_size)
+        ctx.window_size = int(window_size)
+        ctx.q_offset = int(q_offset)
         return o
 
     @staticmethod
@@ -616,6 +699,10 @@ class _BlockSparseFlashAttention(torch.autograd.Function):
         softmax_scale: float = ctx.softmax_scale
         block_m: int = ctx.block_m
         block_n: int = ctx.block_n
+        is_causal: bool = ctx.is_causal
+        sink_size: int = ctx.sink_size
+        window_size: int = ctx.window_size
+        q_offset: int = ctx.q_offset
 
         do = do.contiguous()
         B, H, N_Q, D = q.shape
@@ -645,6 +732,7 @@ class _BlockSparseFlashAttention(torch.autograd.Function):
             q, k, v, do, dk, dv, lse, delta,
             block_mask,
             softmax_scale,
+            int(sink_size), int(window_size), int(q_offset),
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
@@ -659,6 +747,7 @@ class _BlockSparseFlashAttention(torch.autograd.Function):
             BLOCK_N=block_n,
             HEAD_DIM=D,
             NUM_Q_BLOCKS=n_qb,
+            IS_CAUSAL=is_causal,
             num_warps=4,
             num_stages=2,
         )
@@ -668,6 +757,7 @@ class _BlockSparseFlashAttention(torch.autograd.Function):
             q, k, v, do, dq, lse, delta,
             block_mask,
             softmax_scale,
+            int(sink_size), int(window_size), int(q_offset),
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),
@@ -681,11 +771,12 @@ class _BlockSparseFlashAttention(torch.autograd.Function):
             BLOCK_N=block_n,
             HEAD_DIM=D,
             NUM_KV_BLOCKS=n_kb,
+            IS_CAUSAL=is_causal,
             num_warps=4,
             num_stages=2,
         )
 
-        return dq, dk, dv, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -701,6 +792,9 @@ def block_sparse_attention(
     softmax_scale: Optional[float] = None,
     block_m: int = 64,
     block_n: int = 64,
+    is_causal: bool = False,
+    sink_size: int = 0,
+    window_size: int = 0,
 ) -> torch.Tensor:
     """Differentiable block-sparse Flash-Attention.
 
@@ -712,22 +806,34 @@ def block_sparse_attention(
         ``{16, 32, 64, 128}`` for best codegen.
     block_mask:
         Shape ``[n_q_blocks, n_kv_blocks]``, dtype coercible to int32.
+        Visited iff the entry is non-zero; a visited block *still*
+        receives the in-block token-level mask when ``is_causal=True``.
     softmax_scale:
         Logit scale. Defaults to :math:`1 / \\sqrt{D}`.
     block_m, block_n:
         Row/column tile sizes. Must divide the sequence lengths.
+    is_causal:
+        If ``True``, enforces the StreamingLLM token-level mask
 
-    Returns
-    -------
-    torch.Tensor
-        Output tensor of shape ``[batch, heads, seq_q, head_dim]`` with
-        the same dtype as ``q``.
+        .. code-block:: text
+
+            visible(q, k) =  (k <= q)
+                           & (k < sink_size  OR  k >= q - window_size + 1)
+
+        inside every visited block, with ``q_pos`` bottom-right aligned
+        to the KV cache (``q_offset = N_KV - N_Q``). Without this,
+        diagonal blocks let tokens see the future and a decode query
+        sees only the sink prefix (prompt 004 bugs A, B).
+    sink_size, window_size:
+        Token-level StreamingLLM parameters. Only consulted when
+        ``is_causal=True``.
     """
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
     return _BlockSparseFlashAttention.apply(
         q.contiguous(), k.contiguous(), v.contiguous(),
         block_mask, float(softmax_scale), int(block_m), int(block_n),
+        bool(is_causal), int(sink_size), int(window_size),
     )
 
 
@@ -744,32 +850,86 @@ def reference_block_sparse_attention(
     softmax_scale: Optional[float] = None,
     block_m: int = 64,
     block_n: int = 64,
+    is_causal: bool = False,
+    sink_size: int = 0,
+    window_size: int = 0,
 ) -> torch.Tensor:
     """Pure-PyTorch reference for :func:`block_sparse_attention`.
 
     Materialises the full :math:`[N_Q, N_{KV}]` logit matrix with
-    :math:`-\\infty` outside the mask, then calls softmax. This is
-    :math:`\\Theta(N^2)` memory and only exists for correctness checks
+    :math:`-\\infty` outside the mask, then calls softmax.
+    :math:`\\Theta(N^2)` memory; only exists for correctness checks
     against the Triton kernel on small inputs.
+
+    The effective mask is ``block_mask_lifted_to_tokens AND token_mask``,
+    where ``token_mask`` is the token-level StreamingLLM mask when
+    ``is_causal=True`` (fix H-2 from docs/architecture_notes.md: the
+    oracle must apply the same in-block token mask as the kernel, or
+    gradcheck validates like-with-like against the wrong semantics).
     """
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
 
     B, H, N_Q, D = q.shape
     _, _, N_KV, _ = k.shape
-    n_qb, n_kb = block_mask.shape
 
-    # Expand block-level mask to token-level [N_Q, N_KV].
-    token_mask = block_mask.to(torch.bool).repeat_interleave(block_m, dim=0)
-    token_mask = token_mask.repeat_interleave(block_n, dim=1)
-    token_mask = token_mask[:N_Q, :N_KV]
+    # Lift block-level mask to token level.
+    lifted = block_mask.to(torch.bool).repeat_interleave(block_m, dim=0)
+    lifted = lifted.repeat_interleave(block_n, dim=1)
+    lifted = lifted[:N_Q, :N_KV]
+
+    if is_causal:
+        # Bottom-right aligned q positions (prompt 004 bug B): the N_Q
+        # queries live at the LAST N_Q positions of the KV range, so
+        # q_pos = (N_KV - N_Q) + arange(N_Q).
+        q_pos = torch.arange(N_KV - N_Q, N_KV, device=q.device)
+        k_pos = torch.arange(N_KV, device=q.device)
+        sink = k_pos[None, :] < sink_size
+        causal = k_pos[None, :] <= q_pos[:, None]
+        windowed = k_pos[None, :] >= (q_pos[:, None] - window_size + 1)
+        # Correct formula (prompt 004 bug A): `causal & (sink | window)`.
+        # The old `sink | (causal & window)` let q < sink_size attend to
+        # future sink keys.
+        in_block = causal & (sink | windowed)
+        effective = lifted & in_block
+    else:
+        effective = lifted
 
     scores = torch.matmul(q, k.transpose(-2, -1)) * softmax_scale  # [B,H,N_Q,N_KV]
-    scores = scores.masked_fill(~token_mask, float("-inf"))
+    scores = scores.masked_fill(~effective, float("-inf"))
     probs = torch.softmax(scores, dim=-1)
-    # Guard against all-masked rows (shouldn't happen for StreamingLLM).
     probs = torch.nan_to_num(probs, nan=0.0)
     return torch.matmul(probs, v)
+
+
+def streaming_token_mask(
+    n_q: int, n_kv: int, sink_size: int, window_size: int,
+    device: torch.device | str = "cpu",
+) -> torch.Tensor:
+    """Return the exact token-level StreamingLLM mask.
+
+    Shape ``[n_q, n_kv]``, dtype bool. ``True`` iff the (q, k) token
+    pair is attended to under the paper's definition, with queries
+    **bottom-right aligned** to the KV cache (prompt 004 bug B):
+
+    .. math::
+
+        \\text{visible}(q, k) \\;=\\;
+        (k \\le q) \\;\\wedge\\;
+        \\bigl( k < S \\;\\vee\\; k \\ge q - W + 1 \\bigr),
+        \\qquad q \\in [N_{KV} - N_Q,\\; N_{KV}).
+
+    The old formula ``sink | (causal & window)`` let a query at
+    position :math:`q < S` attend to future sink keys :math:`k > q`.
+    The correct formula is ``causal & (sink | window)`` (prompt 004
+    bug A).  Independent of any block-level mask.
+    """
+    q_pos = torch.arange(n_kv - n_q, n_kv, device=device)
+    k_pos = torch.arange(n_kv, device=device)
+    sink = k_pos[None, :] < sink_size
+    causal = k_pos[None, :] <= q_pos[:, None]
+    windowed = k_pos[None, :] >= (q_pos[:, None] - window_size + 1)
+    return causal & (sink | windowed)
 
 
 __all__ = [
@@ -778,4 +938,5 @@ __all__ = [
     "make_dense_mask",
     "make_streaming_mask",
     "reference_block_sparse_attention",
+    "streaming_token_mask",
 ]

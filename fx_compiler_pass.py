@@ -37,6 +37,7 @@ from typing import Callable, List, Optional, Tuple
 import torch
 import torch.fx as fx
 import torch.nn as nn
+import torch.nn.functional as F  # noqa: N812
 
 from sparse_triton_kernel import (
     StreamingMaskSpec,
@@ -134,12 +135,18 @@ class _InjectedTritonAttention(nn.Module):
         softmax_scale: float,
         block_m: int,
         block_n: int,
+        is_causal: bool = False,
+        sink_size: int = 0,
+        window_size: int = 0,
     ) -> None:
         super().__init__()
         self.register_buffer("block_mask", block_mask, persistent=False)
         self.softmax_scale = float(softmax_scale)
         self.block_m = int(block_m)
         self.block_n = int(block_n)
+        self.is_causal = bool(is_causal)
+        self.sink_size = int(sink_size)
+        self.window_size = int(window_size)
 
     def forward(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
@@ -150,6 +157,9 @@ class _InjectedTritonAttention(nn.Module):
             softmax_scale=self.softmax_scale,
             block_m=self.block_m,
             block_n=self.block_n,
+            is_causal=self.is_causal,
+            sink_size=self.sink_size,
+            window_size=self.window_size,
         )
 
 
@@ -195,7 +205,7 @@ class InjectionConfig:
 
 @dataclass
 class _AttentionMatch:
-    """A located scaled-dot-product-attention subgraph."""
+    """A located scaled-dot-product-attention subgraph (eager form)."""
 
     q_node: fx.Node
     k_node: fx.Node
@@ -207,6 +217,24 @@ class _AttentionMatch:
     softmax_node: fx.Node
     pv_node: fx.Node  # Final matmul node — the match's output.
     scale_value: float
+
+
+@dataclass
+class _SDPAMatch:
+    """A located ``F.scaled_dot_product_attention`` call to replace.
+
+    Prompt 003 step 3: the FX pass used to only match the hand-written
+    softmax(matmul(scale(matmul))) motif. Real models route attention
+    through ``F.scaled_dot_product_attention``, which is a single
+    opaque ``call_function`` node — no softmax to pivot on.
+    """
+
+    sdpa_node: fx.Node
+    q_node: fx.Node
+    k_node: fx.Node
+    v_node: fx.Node
+    is_causal: bool
+    scale_value: Optional[float]  # None → use injector default (1/√D)
 
 
 # A node is a "matmul call" if it is either ``torch.matmul`` or the
@@ -247,6 +275,39 @@ def _is_transpose(node: fx.Node) -> bool:
     )
 
 
+# F.scaled_dot_product_attention compares by identity under fx.
+# Both the public and the internal entry-points resolve to the same
+# function object in torch >= 2.0, but we check both for robustness
+# across versions / monkeypatches.
+_SDPA_TARGETS: Tuple[Callable, ...] = tuple(
+    t for t in (
+        F.scaled_dot_product_attention,
+        getattr(getattr(torch, "_C", None), "_nn", None),
+    )
+    if callable(t)
+)
+
+
+def _is_sdpa(node: fx.Node) -> bool:
+    return node.op == "call_function" and node.target in _SDPA_TARGETS
+
+
+def _sdpa_param(node: fx.Node, name: str, position: int, default: object) -> object:
+    """Extract an SDPA kwarg either from kwargs or from positional args.
+
+    SDPA signature:
+        scaled_dot_product_attention(query, key, value,
+                                     attn_mask=None, dropout_p=0.0,
+                                     is_causal=False, scale=None,
+                                     enable_gqa=False)
+    """
+    if name in node.kwargs:
+        return node.kwargs[name]
+    if len(node.args) > position:
+        return node.args[position]
+    return default
+
+
 def _extract_scalar(node: fx.Node) -> Optional[float]:
     """Try to pull out the scalar factor from a scale node.
 
@@ -283,9 +344,19 @@ class BlockSparseAttentionInjector:
     # -- Mask materialisation ------------------------------------------------
 
     def _build_mask(self) -> torch.Tensor:
+        """Build the block mask lazily on CPU (prompt 004 L-3).
+
+        Previously the mask was allocated on ``cfg.device`` (default
+        ``"cuda"``) at injector-construction time, which blew up on a
+        CPU-only host. The buffer registered on ``_InjectedTritonAttention``
+        follows the containing module's ``.to(device)`` call, so
+        allocating on CPU here is sufficient: the user calls
+        ``fused.to("cuda")`` after ``.transform(...)`` and the mask
+        follows.
+        """
         if self.cfg.custom_mask is not None:
-            return self.cfg.custom_mask.to(
-                device=self.cfg.device, dtype=torch.int32
+            return self.cfg.custom_mask.detach().to(
+                device="cpu", dtype=torch.int32
             ).contiguous()
         if self.cfg.streaming is None:
             raise ValueError("Must supply either `streaming` or `custom_mask`")
@@ -293,7 +364,7 @@ class BlockSparseAttentionInjector:
             self.cfg.seq_len_q, self.cfg.seq_len_kv,
             self.cfg.streaming,
             self.cfg.block_m, self.cfg.block_n,
-            device=self.cfg.device,
+            device="cpu",
         )
 
     # -- Pattern matching ----------------------------------------------------
@@ -404,32 +475,127 @@ class BlockSparseAttentionInjector:
     def transform(self, model: nn.Module) -> fx.GraphModule:
         """Trace ``model`` and inject the Triton kernel.
 
+        Matches both:
+          - the hand-written ``softmax(matmul(scale(matmul)))`` motif,
+          - ``F.scaled_dot_product_attention(..., is_causal=True)``.
+
         Returns a new ``fx.GraphModule``; the input ``model`` is left
         untouched.
         """
         traced = fx.symbolic_trace(model)
-        matches = self._match_attention_subgraph(traced.graph, traced)
-        if not matches:
+        eager_matches = self._match_attention_subgraph(traced.graph, traced)
+        sdpa_matches = self._match_sdpa_subgraph(traced.graph)
+        if not eager_matches and not sdpa_matches:
             raise RuntimeError(
-                "No scaled-dot-product-attention subgraph found. "
-                "Did you pass a module that wraps StandardAttention?"
+                "No scaled-dot-product-attention subgraph found "
+                "(neither the eager softmax(QKᵀ·s)V motif nor an "
+                "F.scaled_dot_product_attention(is_causal=True) call)."
             )
-        for i, match in enumerate(matches):
-            self._install_match(traced, match, index=i)
+        # Capture final indices now (they must be contiguous starting at 0
+        # for the submodule naming), then rewrite in reverse topological
+        # order so a downstream SDPA call still sees its upstream SDPA's
+        # original node until we touch it, letting replace_all_uses_with
+        # patch the def-use edge rather than leaving a stale reference.
+        eager_indexed = list(enumerate(eager_matches))
+        sdpa_start = len(eager_matches)
+        sdpa_indexed = [(sdpa_start + i, m) for i, m in enumerate(sdpa_matches)]
+        for idx, match in reversed(sdpa_indexed):
+            self._install_sdpa_match(traced, match, index=idx)
+        for idx, match in reversed(eager_indexed):
+            self._install_match(traced, match, index=idx)
         traced.graph.lint()
         traced.recompile()
         return traced
+
+    # -- SDPA matching -------------------------------------------------------
+
+    @staticmethod
+    def _match_sdpa_subgraph(graph: fx.Graph) -> List[_SDPAMatch]:
+        """Enumerate `F.scaled_dot_product_attention(is_causal=True)` calls."""
+        matches: List[_SDPAMatch] = []
+        for node in graph.nodes:
+            if not _is_sdpa(node):
+                continue
+            if len(node.args) < 3:
+                continue
+            q, k, v = node.args[0], node.args[1], node.args[2]
+            if not (isinstance(q, fx.Node)
+                    and isinstance(k, fx.Node)
+                    and isinstance(v, fx.Node)):
+                continue
+            is_causal = _sdpa_param(node, "is_causal", 5, False)
+            if not bool(is_causal):
+                # We refuse to match non-causal SDPA: it may rely on
+                # an attn_mask that is a dynamic tensor the kernel
+                # cannot absorb into its static block mask. A later
+                # prompt can add explicit-mask matching.
+                continue
+            dropout_p = _sdpa_param(node, "dropout_p", 4, 0.0)
+            if isinstance(dropout_p, (int, float)) and float(dropout_p) != 0.0:
+                continue  # dropout != 0 changes semantics; refuse.
+            scale = _sdpa_param(node, "scale", 6, None)
+            scale_value: Optional[float]
+            if scale is None:
+                scale_value = None
+            elif isinstance(scale, (int, float)):
+                scale_value = float(scale)
+            else:
+                continue  # dynamic scale we can't resolve; skip.
+            matches.append(_SDPAMatch(
+                sdpa_node=node, q_node=q, k_node=k, v_node=v,
+                is_causal=True, scale_value=scale_value,
+            ))
+        return matches
+
+    def _install_sdpa_match(
+        self, gm: fx.GraphModule, match: _SDPAMatch, index: int,
+    ) -> None:
+        name = f"_triton_attn_{index}"
+        default_scale = 1.0 / math.sqrt(self.cfg.head_dim)
+        scale = match.scale_value if match.scale_value is not None else default_scale
+        is_causal = match.is_causal
+        sink_size = self.cfg.streaming.sink_size if self.cfg.streaming else 0
+        # If the user asked for SDPA causal but didn't configure
+        # StreamingLLM, interpret as "pure causal" by picking a
+        # window large enough to admit every past token.
+        window_size = (
+            self.cfg.streaming.window_size if self.cfg.streaming
+            else self.cfg.seq_len_kv
+        )
+        gm.add_submodule(name, _InjectedTritonAttention(
+            block_mask=self._mask,
+            softmax_scale=scale,
+            block_m=self.cfg.block_m,
+            block_n=self.cfg.block_n,
+            is_causal=is_causal,
+            sink_size=sink_size,
+            window_size=window_size,
+        ))
+        with gm.graph.inserting_before(match.sdpa_node):
+            new_node = gm.graph.call_module(
+                name, args=(match.q_node, match.k_node, match.v_node),
+            )
+        match.sdpa_node.replace_all_uses_with(new_node)
+        _safe_erase(gm.graph, match.sdpa_node)
 
     def _install_match(
         self, gm: fx.GraphModule, match: _AttentionMatch, index: int,
     ) -> None:
         """Replace one matched subgraph with a call_module node."""
         name = f"_triton_attn_{index}"
+        is_causal = self.cfg.streaming is not None
+        sink_size = self.cfg.streaming.sink_size if is_causal else 0
+        window_size = (
+            self.cfg.streaming.window_size if is_causal else 0
+        )
         gm.add_submodule(name, _InjectedTritonAttention(
             block_mask=self._mask,
             softmax_scale=match.scale_value,
             block_m=self.cfg.block_m,
             block_n=self.cfg.block_n,
+            is_causal=is_causal,
+            sink_size=sink_size,
+            window_size=window_size,
         ))
 
         with gm.graph.inserting_before(match.pv_node):

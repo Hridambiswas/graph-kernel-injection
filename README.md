@@ -1,22 +1,48 @@
 # Automated Graph-Level Kernel Injection for Long-Context LLMs
 
-A self-contained Python repository demonstrating a production-grade
-*ML-compiler pass*: a hand-written Triton kernel for **block-sparse
-Flash-Attention** (forward + backward) and a **PyTorch FX** compiler
-pass that identifies eager attention subgraphs in a traced computation
-graph and automatically swaps them for the fused kernel.
+## Status
 
-The repo is intentionally one logical "pull-request" worth of code:
-small enough to audit top-to-bottom in a sitting, large enough to be
-non-trivial.
+Kernel and FX pass implemented; **mask semantics verified by CPU
+tests** (58 cases under `tests/`, including a hand-written reference
+that calls no repo helper so a shared bug cannot hide). **NOT yet
+run on GPU, no performance numbers yet; GPU verification planned.**
+
+All numeric claims in this README that refer to specific latencies,
+memory numbers, bandwidth or speedups are **analytical** — derived
+from the mask formula and vendor spec sheets — and are marked "not
+yet measured" below. The next milestone is the first hardware run
+via `scripts/gpu_run.sh`; after that, this section will be rewritten
+with the real numbers from `results/<timestamp>/bench_results.csv`.
+
+Written with heavy AI assistance (Claude Code). **Hridam reviewed:**
+TODO. **Hridam verified:** TODO. The repo is a proof-of-work asset
+for outreach to ML systems groups; every claim must be either
+measured on real hardware or explicitly marked unverified. See
+`CLAUDE.md` and `docs/architecture_notes.md` for the honesty rules
+and the current correctness audit; see `docs/eval_plan.md` for the
+exact shapes and win/tie/loss criteria we will measure.
+
+---
+
+A self-contained Python repository containing a hand-written Triton
+kernel for **block-sparse Flash-Attention** (forward + backward) and
+a **PyTorch FX** compiler pass that identifies eager attention
+subgraphs in a traced computation graph and swaps them for the fused
+kernel.
 
 ```
 sparse_triton_kernel.py   # Triton fwd + bwd kernels, autograd bridge, mask builders
 fx_compiler_pass.py       # torch.fx pattern-match → rewrite → lint → recompile
 benchmark.py              # strict gradcheck + perf harness (GB/s, VRAM, p95)
+tests/                    # CPU-runnable unit tests (mask equivalence, oracle, FX pass)
+scripts/gpu_run.sh        # one-command wrapper for the GPU host
 ```
 
 ## 1. The memory wall in long-context decoding
+
+*All figures in this section are **analytical** — see the Status
+block above. No per-method latency on this hardware has been
+measured yet.*
 
 For an autoregressive decode step at context length $N$ with head
 dimension $D$ (per batch, per head):
@@ -27,21 +53,25 @@ dimension $D$ (per batch, per head):
 | HBM reads (KV)                | $\Theta(ND)$     | $\Theta(ND)$         | $\Theta((S+W)D)$                  |
 | Materialised attention matrix | yes              | **no**               | **no**                            |
 
-Modern GPUs are **not compute bound** at decode time. An H100 reads HBM
-at ≈3.3 TB/s and does fp16 matmul at ≈1 PF/s; the arithmetic intensity
-of attention is low enough that bandwidth dominates. At $N=10^5$,
-$D=64$, dense FlashAttention still has to stream the full
-$2 \times 100\text{k} \times 64 \times 2 = 25.6$ MB of K+V (fp16) per
-head per decode step. The StreamingLLM mask (sink size $S=4$, window
-$W=2048$) reduces that to $2 \times 2052 \times 64 \times 2 \approx
-525$ kB — a **≈ 49× bandwidth reduction** which, under Little's law,
-translates almost linearly into decode speed.
+Modern GPUs are typically bandwidth-bound at decode time (the
+arithmetic intensity of attention is low); the published vendor
+numbers for an H100 are ≈3.3 TB/s of HBM and ≈1 PF/s of fp16
+matmul. At $N=10^5$, $D=64$, dense FlashAttention still has to
+stream the full $2 \times 100\text{k} \times 64 \times 2 = 25.6$
+MB of K+V (fp16) per head per decode step. The StreamingLLM mask
+(sink size $S=4$, window $W=2048$) reduces that to $2 \times 2052
+\times 64 \times 2 \approx 525$ kB — a **≈ 49× analytical reduction
+in KV bytes read**. The actual wall-clock multiplier depends on
+whether the comparison is memory-bound in practice at this shape,
+and is **not yet measured** — the eval plan at `docs/eval_plan.md`
+fixes exactly how we will measure it.
 
-The eager column is included to remind the reader *why* FlashAttention
-exists in the first place: the $N \times N$ scratch at $N=10^5$ costs
-40 GB in fp32 — far beyond any single-GPU HBM budget. The point of
-this repo is to compose both wins — Flash tiling and block sparsity —
-and automate the plumbing with a compiler pass.
+The eager column is included to remind the reader *why*
+FlashAttention exists at all: the $N \times N$ scratch at $N=10^5$
+is $\approx 40$ GB in fp32 (analytical), far beyond any single-GPU
+HBM budget. The repo composes two existing wins (Flash tiling and
+block sparsity) and adds a small FX pass that swaps the kernel in
+automatically.
 
 ## 2. StreamingLLM sparsity pattern
 
@@ -87,18 +117,30 @@ motif replaced by a single `call_module` node.
 ```
 
 The pattern detector in
-[`fx_compiler_pass.py`](fx_compiler_pass.py) is a single-pass
-$O(|V|)$ walk over the FX graph nodes that pattern-matches a
-`softmax` node and climbs back through its inputs: `softmax → mul (or
-truediv) → matmul → transpose`, plus one forward hop to `matmul → V`.
-The rewriter installs an `_InjectedTritonAttention` child module on
-the `GraphModule`, inserts a `call_module` node immediately before the
-old output matmul, redirects users, and erases the subgraph in reverse
-topological order. Finally `graph.lint()` statically checks def-use
-consistency and `recompile()` regenerates Python source.
+[`fx_compiler_pass.py`](fx_compiler_pass.py) does two passes over
+the FX graph nodes:
 
-The pass is *idempotent*: a graph that has already been rewritten
-contains no softmax→matmul motif and the pass is a no-op.
+1. A single-pass $O(|V|)$ walk pivoting on `softmax` nodes,
+   climbing back through `softmax → mul (or truediv) → matmul →
+   transpose`, plus one forward hop to `matmul → V`. Matches the
+   repo's own hand-written `StandardAttention` motif.
+2. A second $O(|V|)$ walk for `F.scaled_dot_product_attention`
+   call_function nodes with `is_causal=True` and `dropout_p=0`.
+   Added by prompt 003 so models that already use SDPA are also
+   matched; non-causal SDPA is deliberately refused for now because
+   the kernel can't absorb a dynamic `attn_mask` tensor.
+
+The rewriter installs an `_InjectedTritonAttention` child module on
+the `GraphModule`, inserts a `call_module` node immediately before
+the matched output node, redirects users, and erases the subgraph.
+Matches are installed in reverse topological order so chained
+attention calls don't leave stale references in the dataclass.
+Finally `graph.lint()` statically checks def-use consistency and
+`recompile()` regenerates Python source.
+
+Not matched: `torch.nn.MultiheadAttention`, Hugging Face transformer
+attention classes. No test exists for either; see
+`docs/architecture_notes.md §2` for the specifics.
 
 ## 4. The Triton kernel
 
@@ -146,49 +188,78 @@ recompute it.
 
 ## 5. Correctness
 
-Running `python benchmark.py verify-grads` executes **three** stacked
-checks:
+Running `python benchmark.py verify-grads` executes three stacked
+checks and gates the perf benchmark behind them. The CLI tries the
+tightest tier it can and prints which path it took:
 
-1. `torch.autograd.gradcheck` on tiny shapes (B=1, H=2, N=64, D=16) in
-   strict fp32 mode (`allow_tf32=False`,
-   `float32_matmul_precision="highest"`). Falls up to fp64 if the host
-   supports it (SM80+, Triton ≥ 2.1).
-2. `torch.autograd.gradgradcheck` for second-order consistency.
-3. Direct element-wise allclose vs eager autograd on larger (fp32)
-   shapes — the FlashAttention verification protocol.
+1. `torch.autograd.gradcheck` + `gradgradcheck` on tiny shapes
+   (B=1, H=2, N=64, D=16). First tier: **fp64** with
+   `eps=1e-6, atol=1e-5, rtol=1e-3`. This path requires a GPU
+   whose `tl.dot` supports fp64 — typically only datacenter cards
+   (A100, H100). On consumer / laptop GPUs the fp64 path raises at
+   the Triton level and the harness falls back to tier 2 with a
+   clearly logged notice.
+2. **fp32 FA2 protocol**: same shapes in strict fp32
+   (`allow_tf32=False`, `float32_matmul_precision="highest"`) with
+   `eps=1e-3, atol=5e-3, rtol=5e-3`.
+3. Direct element-wise allclose of `(dQ, dK, dV)` vs eager autograd
+   on larger (fp32) shapes.
 
-Any failure raises; the CLI then refuses to run the perf benchmark.
-Performance numbers are never reported for an unverified kernel.
+Any failure raises; the CLI exits non-zero and refuses to run the
+perf benchmark. The specific tier taken is printed in the log so a
+reader can tell whether fp64 was actually exercised or whether the
+fallback kicked in. The log line `FP64 GRADCHECK NOT RUN: <reason>`
+appears when the fp64 path is skipped, and the final summary line
+`[summary] gradcheck.fp64_ran=…` records which tier ran. In
+addition, 58 CPU-runnable unit tests under `tests/` cover the
+token-level mask equivalence (fixes for bugs A and B — sink future
+leak and bottom-right q alignment), the block mask superset
+condition on non-divisible shapes, the oracle vs a hand-written
+reference, and the FX pass's SDPA matching — these do not require
+Triton or a GPU.
 
 ## 6. Benchmarks
 
-Placeholder table — populate with your own hardware readings:
+**No numbers are published here yet.** After the first GPU run under
+`scripts/gpu_run.sh`, this section will be rewritten verbatim from
+`results/<timestamp>/bench_results.csv`. The exact shapes we plan to
+measure, the win/tie/loss criteria vs FlexAttention, and the
+honesty disclaimer about what we are *not* claiming are specified
+in [`docs/eval_plan.md`](docs/eval_plan.md).
 
-| Config (B,H,N<sub>Q</sub>,N<sub>KV</sub>,D,sink,win) | Path   | p50 ms | p95 ms | peak VRAM | HBM GB/s |
-| :--------------------------------------------------- | :----- | -----: | -----: | --------: | -------: |
-| (1, 32, 1, 131072, 128, 4, 2048)                     | eager  |      — |      — | **OOM**   |        — |
-| (1, 32, 1, 131072, 128, 4, 2048)                     | triton |        |        |           |          |
-| (1, 32, 1, 32768, 128, 4, 2048)                      | eager  |        |        |           |          |
-| (1, 32, 1, 32768, 128, 4, 2048)                      | triton |        |        |           |          |
+The benchmark sweep compares five methods on the **same**
+token-level StreamingLLM mask: `triton-block-sparse` (this repo),
+`flex-attention` (torch 2.5+), `sdpa-explicit-mask` (SDPA with the
+same boolean mask), `sdpa-causal-dense` (plain causal SDPA — "no
+sparsity" reference, not StreamingLLM), and `eager-dense`
+(reference oracle). Per-method output: fwd p50/p95, fwd+bwd
+p50/p95, peak VRAM, and max abs error vs an fp64 oracle at a
+scaled-down shape.
 
-Benchmark outputs a CSV (`bench_results.csv`) and a Chrome-trace per
-path under `traces/` for `chrome://tracing` consumption.
+Benchmark outputs a CSV (`bench_results.csv`) and a Chrome-trace
+per method under `traces/`.
 
 ## 7. Install & usage
 
-The Triton path requires a Linux + CUDA host (Triton does not ship for
-macOS). Local lint-only sanity passes on any OS.
+The Triton path requires a Linux + CUDA host (Triton does not ship
+for macOS). Local lint-only sanity + the CPU-runnable unit tests
+pass on any OS.
 
 ```bash
 cd ~/graph-kernel-injection
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# correctness (gradcheck + fwd allclose) — must pass
+# CPU-only tests (no Triton required) — must pass
+python -m pytest tests/
+
+# everything else requires an NVIDIA GPU on Linux:
+bash scripts/gpu_run.sh          # full-size shapes
+bash scripts/gpu_run.sh --small  # trimmed for an 8 GiB laptop GPU
+
+# or call benchmark.py directly:
 python benchmark.py verify-grads
 python benchmark.py verify-fwd
-
-# full perf sweep
 python benchmark.py benchmark --seq-len 131072 --sink 4 --window 2048 --dtype fp16
 ```
 

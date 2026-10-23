@@ -39,30 +39,39 @@ import argparse
 import csv
 import dataclasses
 import math
-import os
 import statistics
 import sys
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
+import torch.nn.functional as F  # noqa: N812
 
 try:
-    import triton
-    import triton.testing
+    import triton  # noqa: F401 — availability guard only
+    import triton.testing  # noqa: F401
 
     _TRITON_AVAILABLE = True
 except ImportError:  # pragma: no cover
-    triton = None  # type: ignore[assignment]
     _TRITON_AVAILABLE = False
+
+try:
+    from torch.nn.attention.flex_attention import (
+        create_block_mask as _flex_create_block_mask,
+        flex_attention as _flex_attention,
+    )
+
+    _FLEX_AVAILABLE = True
+except ImportError:  # pragma: no cover — torch < 2.5
+    _FLEX_AVAILABLE = False
 
 from sparse_triton_kernel import (
     StreamingMaskSpec,
     block_sparse_attention,
     make_streaming_mask,
     reference_block_sparse_attention,
+    streaming_token_mask,
 )
 
 
@@ -166,9 +175,13 @@ def verify_forward_correctness(cfg: HarnessConfig) -> int:
         mask = _make_mask(small)
         tri = block_sparse_attention(
             q, k, v, mask, block_m=small.block_m, block_n=small.block_n,
+            is_causal=True, sink_size=small.sink_size,
+            window_size=small.window_size,
         )
         ref = reference_block_sparse_attention(
             q, k, v, mask, block_m=small.block_m, block_n=small.block_n,
+            is_causal=True, sink_size=small.sink_size,
+            window_size=small.window_size,
         )
         max_abs = (tri - ref).abs().max().item()
         max_rel = ((tri - ref).abs() / ref.abs().clamp_min(1e-6)).max().item()
@@ -189,17 +202,19 @@ def verify_forward_correctness(cfg: HarnessConfig) -> int:
 
 def _gradcheck_fn(
     mask: torch.Tensor, scale: float, block_m: int, block_n: int,
+    sink_size: int, window_size: int,
 ) -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
     """Partial-applied kernel suitable for :func:`torch.autograd.gradcheck`.
 
     gradcheck requires a function whose only autograd-tracked inputs
-    are tensors; the block mask and the scale factor are frozen in a
-    closure.
+    are tensors; the block mask, scale factor and token-level
+    StreamingLLM parameters are frozen in a closure.
     """
     def inner(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         return block_sparse_attention(
             q, k, v, mask, softmax_scale=scale,
             block_m=block_m, block_n=block_n,
+            is_causal=True, sink_size=sink_size, window_size=window_size,
         )
     return inner
 
@@ -227,6 +242,7 @@ def _run_gradchecks(
     mask = _make_mask(tiny)
     fn = _gradcheck_fn(
         mask, 1.0 / math.sqrt(tiny.head_dim), tiny.block_m, tiny.block_n,
+        tiny.sink_size, tiny.window_size,
     )
     print(
         f"[gradcheck] dtype={dtype}, shape=(B={tiny.batch}, H={tiny.heads}, "
@@ -280,18 +296,26 @@ def verify_gradients(cfg: HarnessConfig) -> int:
     _enable_strict_fp32()
 
     # --- 1 + 2. gradcheck + gradgradcheck under graceful fp64→fp32 fallback ---
-    # Per Gemini's architectural review: wrap the *entire* fp64 gradcheck call
-    # in try/except (not merely the probe). If fp64 matmul is unsupported, or
-    # if any step of the fp64 path raises for any reason, we degrade to the
-    # FlashAttention-2 fp32 protocol with no loss of audit evidence.
+    # If fp64 matmul is unsupported (common on consumer GPUs), we degrade to
+    # the FlashAttention-2 fp32 protocol. M-3 (prompt 004): make it explicit
+    # which tier ran so a reader of the log cannot miss that fp64 was
+    # skipped, and surface the result in the final summary.
+    fp64_ran = False
+    fp64_skip_reason: Optional[str] = None
     try:
         _run_gradchecks(cfg, torch.float64, eps=1e-6, atol=1e-5, rtol=1e-3)
         print("[gradcheck] ✓ fp64 strict path completed")
+        fp64_ran = True
     except Exception as e:
+        fp64_skip_reason = f"{type(e).__name__}: {e}"
+        print(f"FP64 GRADCHECK NOT RUN: {fp64_skip_reason}")
         print(
-            f"[gradcheck] fp64 path raised {type(e).__name__}: {e}; "
-            f"degrading to FA2 fp32 protocol (eps=1e-3, atol=5e-3, rtol=5e-3)"
+            "[gradcheck] degrading to FA2 fp32 protocol "
+            "(eps=1e-3, atol=5e-3, rtol=5e-3)"
         )
+        # NOTE: a failure here is NOT silently caught — it propagates out
+        # of verify_gradients() and the CLI exits non-zero, as required
+        # (M-3: exit nonzero if any check that ran fails).
         _run_gradchecks(cfg, torch.float32, eps=1e-3, atol=5e-3, rtol=5e-3)
         print("[gradcheck] ✓ fp32 FA2 fallback completed")
 
@@ -308,9 +332,11 @@ def verify_gradients(cfg: HarnessConfig) -> int:
 
     out_tri = block_sparse_attention(
         q, k, v, mask, block_m=mid.block_m, block_n=mid.block_n,
+        is_causal=True, sink_size=mid.sink_size, window_size=mid.window_size,
     )
     out_ref = reference_block_sparse_attention(
         q_ref, k_ref, v_ref, mask, block_m=mid.block_m, block_n=mid.block_n,
+        is_causal=True, sink_size=mid.sink_size, window_size=mid.window_size,
     )
     g = torch.randn_like(out_tri)
     (out_tri * g).sum().backward()
@@ -328,6 +354,10 @@ def verify_gradients(cfg: HarnessConfig) -> int:
         )
         assert ok, f"{name} does not match eager autograd"
 
+    print(
+        f"[summary] gradcheck.fp64_ran={fp64_ran}"
+        + (f"  (fp64 skip reason: {fp64_skip_reason})" if not fp64_ran else "")
+    )
     print("[verify] ✓ ALL correctness checks passed")
     return 0
 
@@ -335,78 +365,80 @@ def verify_gradients(cfg: HarnessConfig) -> int:
 # ---------------------------------------------------------------------------
 # Performance benchmarking
 # ---------------------------------------------------------------------------
+#
+# Prompt 003 widens the harness from "Triton vs eager" to a fair comparison
+# against production attention backends on the SAME token-level mask:
+#
+#   - triton-block-sparse: this repo's kernel, is_causal=True + sink/window
+#   - flex-attention     : torch.nn.attention.flex_attention with a block
+#                          mask built from a Python mask_mod matching the
+#                          StreamingLLM token rule
+#   - sdpa-mask          : F.scaled_dot_product_attention with the same
+#                          [N_Q, N_KV] boolean mask (True = attend)
+#   - sdpa-causal        : F.scaled_dot_product_attention(is_causal=True)
+#                          as a *dense* "no sparsity" reference (not
+#                          StreamingLLM; included so we see what the
+#                          FlashAttention backend costs at this shape)
+#   - eager-dense        : reference_block_sparse_attention — Θ(N²)
+#                          scratch; only runs if it fits
+#
+# For each method we report fwd p50/p95, fwd+bwd p50/p95, peak VRAM, and
+# the max abs error vs an fp64 oracle at a scaled-down shape where the
+# oracle fits.
+# ---------------------------------------------------------------------------
 
 
 @dataclass
 class BenchResult:
-    """Container for one row of benchmark output."""
+    """One row of benchmark output."""
 
     label: str
     dtype: str
     seq_len_kv: int
     density: float
-    latency_p50_ms: float
-    latency_p95_ms: float
-    latency_p99_ms: float
+    fwd_p50_ms: float
+    fwd_p95_ms: float
+    fwdbwd_p50_ms: Optional[float]
+    fwdbwd_p95_ms: Optional[float]
     peak_vram_mib: float
-    bytes_moved: int
-    bandwidth_gb_s: float
+    max_abs_err_vs_fp64: Optional[float]
 
     def to_row(self) -> List[str]:
+        def _opt(x: Optional[float], spec: str) -> str:
+            return "n/a" if x is None else format(x, spec)
         return [
             self.label, self.dtype, str(self.seq_len_kv),
             f"{self.density:.4f}",
-            f"{self.latency_p50_ms:.3f}", f"{self.latency_p95_ms:.3f}",
-            f"{self.latency_p99_ms:.3f}",
+            f"{self.fwd_p50_ms:.3f}", f"{self.fwd_p95_ms:.3f}",
+            _opt(self.fwdbwd_p50_ms, ".3f"), _opt(self.fwdbwd_p95_ms, ".3f"),
             f"{self.peak_vram_mib:.1f}",
-            str(self.bytes_moved),
-            f"{self.bandwidth_gb_s:.1f}",
+            _opt(self.max_abs_err_vs_fp64, ".2e"),
         ]
 
 
 _HEADERS: Tuple[str, ...] = (
     "label", "dtype", "seq_kv", "mask_density",
-    "p50_ms", "p95_ms", "p99_ms", "peak_vram_MiB",
-    "bytes_moved", "bandwidth_GB_s",
+    "fwd_p50_ms", "fwd_p95_ms",
+    "fwdbwd_p50_ms", "fwdbwd_p95_ms",
+    "peak_vram_MiB",
+    "max_abs_err_vs_fp64",
 )
 
 
-def _bytes_moved_eager(cfg: HarnessConfig, dtype: torch.dtype) -> int:
-    """Lower bound on HBM traffic for the eager path.
-
-    Reads Q, K, V and writes O. The materialised :math:`QK^\\top` tile
-    additionally costs :math:`B H N_Q N_{KV}` fp32 scratch, which is
-    the dominant term at large :math:`N`.
-    """
-    el = torch.tensor([], dtype=dtype).element_size()
-    bhd = cfg.batch * cfg.heads * cfg.head_dim
-    rw_qkv = (cfg.seq_len_q + 2 * cfg.seq_len_kv) * bhd * el
-    scratch = cfg.batch * cfg.heads * cfg.seq_len_q * cfg.seq_len_kv * 4  # fp32
-    return int(rw_qkv + scratch)
-
-
-def _bytes_moved_triton(
-    cfg: HarnessConfig, dtype: torch.dtype, density: float
-) -> int:
-    """Lower bound on HBM traffic for the Triton path.
-
-    Reads Q once, reads K/V only for the ``density`` fraction of
-    blocks, writes O once. Softmax statistics are LSE-only (one scalar
-    per Q row).
-    """
-    el = torch.tensor([], dtype=dtype).element_size()
-    bhd = cfg.batch * cfg.heads * cfg.head_dim
-    q_rw = cfg.seq_len_q * bhd * el
-    kv_r = int(density * 2 * cfg.seq_len_kv * bhd * el)
-    o_w = cfg.seq_len_q * bhd * el
-    lse = cfg.batch * cfg.heads * cfg.seq_len_q * 4
-    return int(q_rw + kv_r + o_w + lse)
+def _percentile(values: Sequence[float], q: float) -> float:
+    s = sorted(values)
+    k = (len(s) - 1) * (q / 100.0)
+    lo = math.floor(k)
+    hi = math.ceil(k)
+    if lo == hi:
+        return s[int(k)]
+    return s[lo] + (s[hi] - s[lo]) * (k - lo)
 
 
 def _measure(
     fn: Callable[[], torch.Tensor], warmup: int, iters: int
 ) -> Tuple[List[float], float]:
-    """Returns per-iter latency samples (ms) and peak VRAM (MiB)."""
+    """Per-iter latency samples (ms) and peak VRAM (MiB) for a fwd callable."""
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
@@ -425,121 +457,290 @@ def _measure(
     return samples_ms, peak
 
 
-def _profile_once(
-    fn: Callable[[], torch.Tensor], trace_path: Path, label: str,
-) -> None:
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CUDA,
-                    torch.profiler.ProfilerActivity.CPU],
-        record_shapes=False,
-    ) as prof:
-        fn()
+def _measure_fwdbwd(
+    fwd: Callable[[], torch.Tensor],
+    inputs: Sequence[torch.Tensor],
+    grad_out: torch.Tensor,
+    warmup: int, iters: int,
+) -> Tuple[List[float], float]:
+    """Per-iter latency samples (ms) and peak VRAM for a fwd+bwd callable.
+
+    Resets ``.grad`` each iteration so grad accumulation doesn't bias
+    peak memory over the measurement window.
+    """
+    def one() -> None:
+        for t in inputs:
+            t.grad = None
+        out = fwd()
+        out.backward(grad_out)
+
+    for _ in range(warmup):
+        one()
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+
+    samples_ms: List[float] = []
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    for _ in range(iters):
+        start.record()
+        one()
+        end.record()
         torch.cuda.synchronize()
-    trace_path.parent.mkdir(parents=True, exist_ok=True)
-    prof.export_chrome_trace(str(trace_path))
-    print(f"[profile] trace written to {trace_path} ({label})")
+        samples_ms.append(start.elapsed_time(end))
+    peak = torch.cuda.max_memory_allocated() / (1024 ** 2)
+    return samples_ms, peak
 
 
-def _eager_fn(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-    mask: torch.Tensor, cfg: HarnessConfig,
-) -> Callable[[], torch.Tensor]:
-    scale = 1.0 / math.sqrt(cfg.head_dim)
-    def fn() -> torch.Tensor:
-        return reference_block_sparse_attention(
-            q, k, v, mask, softmax_scale=scale,
-            block_m=cfg.block_m, block_n=cfg.block_n,
-        )
-    return fn
+# -- Baseline factories ------------------------------------------------------
+
+MethodFn = Callable[[], torch.Tensor]
 
 
 def _triton_fn(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     mask: torch.Tensor, cfg: HarnessConfig,
-) -> Callable[[], torch.Tensor]:
+) -> MethodFn:
     scale = 1.0 / math.sqrt(cfg.head_dim)
     def fn() -> torch.Tensor:
         return block_sparse_attention(
             q, k, v, mask, softmax_scale=scale,
             block_m=cfg.block_m, block_n=cfg.block_n,
+            is_causal=True, sink_size=cfg.sink_size, window_size=cfg.window_size,
         )
     return fn
 
 
+def _eager_fn(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    mask: torch.Tensor, cfg: HarnessConfig,
+) -> MethodFn:
+    scale = 1.0 / math.sqrt(cfg.head_dim)
+    def fn() -> torch.Tensor:
+        return reference_block_sparse_attention(
+            q, k, v, mask, softmax_scale=scale,
+            block_m=cfg.block_m, block_n=cfg.block_n,
+            is_causal=True, sink_size=cfg.sink_size, window_size=cfg.window_size,
+        )
+    return fn
+
+
+def _flex_fn(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cfg: HarnessConfig,
+) -> Optional[MethodFn]:
+    """FlexAttention with the StreamingLLM mask built via a mask_mod.
+
+    Returns ``None`` on torch < 2.5 where FlexAttention is absent.
+    """
+    if not _FLEX_AVAILABLE:
+        return None
+    sink, window = cfg.sink_size, cfg.window_size
+    n_q = q.shape[-2]
+    n_kv = k.shape[-2]
+    # Bottom-right alignment to match the kernel / oracle convention
+    # (prompt 004 bug B): FlexAttention mask_mod receives (q_idx,
+    # kv_idx) as 0-indexed positions into their own tensors; we lift
+    # q_idx into the KV coordinate frame.
+    q_offset = n_kv - n_q
+
+    def mask_mod(b, h, q_idx, kv_idx):  # noqa: ARG001 — unused b/h required by API
+        q_abs = q_idx + q_offset
+        is_sink = kv_idx < sink
+        is_causal = kv_idx <= q_abs
+        is_window = kv_idx >= q_abs - window + 1
+        # Correct formula (prompt 004 bug A): causal & (sink | window).
+        return is_causal & (is_sink | is_window)
+
+    block_mask = _flex_create_block_mask(
+        mask_mod, B=None, H=None, Q_LEN=n_q, KV_LEN=n_kv, device=str(q.device),
+    )
+    scale = 1.0 / math.sqrt(cfg.head_dim)
+
+    def fn() -> torch.Tensor:
+        # flex_attention can return (out, aux) when return_lse=True;
+        # we never set that, so the return is a plain Tensor.
+        out = _flex_attention(q, k, v, block_mask=block_mask, scale=scale)
+        assert isinstance(out, torch.Tensor)
+        return out
+    return fn
+
+
+def _sdpa_mask_fn(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cfg: HarnessConfig,
+) -> MethodFn:
+    """SDPA with an explicit boolean token-level mask (True = attend)."""
+    n_q = q.shape[-2]
+    n_kv = k.shape[-2]
+    token_mask = streaming_token_mask(
+        n_q, n_kv, cfg.sink_size, cfg.window_size, device=q.device,
+    )
+    scale = 1.0 / math.sqrt(cfg.head_dim)
+
+    def fn() -> torch.Tensor:
+        return F.scaled_dot_product_attention(
+            q, k, v, attn_mask=token_mask, scale=scale,
+        )
+    return fn
+
+
+def _sdpa_causal_fn(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cfg: HarnessConfig,
+) -> MethodFn:
+    """Plain dense causal SDPA — "no sparsity" reference."""
+    scale = 1.0 / math.sqrt(cfg.head_dim)
+
+    def fn() -> torch.Tensor:
+        return F.scaled_dot_product_attention(
+            q, k, v, is_causal=True, scale=scale,
+        )
+    return fn
+
+
+def _methods(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    mask: torch.Tensor, cfg: HarnessConfig,
+) -> Dict[str, Optional[MethodFn]]:
+    return {
+        "triton-block-sparse": _triton_fn(q, k, v, mask, cfg),
+        "flex-attention":      _flex_fn(q, k, v, cfg),
+        "sdpa-explicit-mask":  _sdpa_mask_fn(q, k, v, cfg),
+        "sdpa-causal-dense":   _sdpa_causal_fn(q, k, v, cfg),
+        "eager-dense":         _eager_fn(q, k, v, mask, cfg),
+    }
+
+
+# -- Max abs error vs fp64 oracle at a scaled-down shape ---------------------
+
+
+def _error_shape(cfg: HarnessConfig) -> HarnessConfig:
+    """Pick a shape where an fp64 dense N² oracle fits (<~1 GiB scratch)."""
+    return dataclasses.replace(
+        cfg,
+        batch=1,
+        heads=2,
+        seq_len_q=min(cfg.seq_len_q if cfg.seq_len_q > 0 else 1, 256),
+        seq_len_kv=min(cfg.seq_len_kv, 256),
+        head_dim=min(cfg.head_dim, 64),
+        block_m=min(cfg.block_m, max(1, min(cfg.seq_len_q, 64))),
+        block_n=min(cfg.block_n, 64),
+        window_size=min(cfg.window_size, 128),
+        sink_size=min(cfg.sink_size, 32),
+        dtype=cfg.dtype,
+    )
+
+
+def _measure_errors(cfg: HarnessConfig) -> Dict[str, Optional[float]]:
+    small = _error_shape(cfg)
+    # fp64 oracle (dense Θ(N²) is fine at this shape).
+    q64, k64, v64 = _make_qkv(small, torch.float64)
+    mask = _make_mask(small)
+    oracle = reference_block_sparse_attention(
+        q64, k64, v64, mask,
+        block_m=small.block_m, block_n=small.block_n,
+        is_causal=True, sink_size=small.sink_size, window_size=small.window_size,
+    )
+
+    # Each method at the harness's working dtype, cast up to fp64 for comparison.
+    q, k, v = _make_qkv(small, small.dtype)
+    fns = _methods(q, k, v, mask, small)
+    errors: Dict[str, Optional[float]] = {}
+    for label, fn in fns.items():
+        if fn is None:
+            errors[label] = None
+            continue
+        try:
+            with torch.no_grad():
+                out = fn().to(torch.float64)
+            errors[label] = float((out - oracle).abs().max().item())
+        except Exception as e:  # noqa: BLE001 — report method failure without aborting
+            print(f"[err] {label}: raised {type(e).__name__}: {e}")
+            errors[label] = None
+    return errors
+
+
+# -- Driver -------------------------------------------------------------------
+
+
 def run_benchmark(cfg: HarnessConfig) -> int:
-    """End-to-end performance comparison between eager and Triton paths."""
     _require_cuda()
-    q, k, v = _make_qkv(cfg, cfg.dtype)
-    mask = _make_mask(cfg)
-    density = _mask_density(mask)
+    density = _mask_density(_make_mask(cfg))
     print(f"[cfg] mask density = {density:.4f}  (keep ratio of block pairs)")
+    print(
+        f"[cfg] flex_attention available: {_FLEX_AVAILABLE} "
+        f"(requires torch>=2.5)"
+    )
 
-    trace_dir = Path("./traces")
+    # Build inputs for fwd (no grad) and fwd+bwd (requires_grad=True) once.
+    # Each method's measurement reuses the same tensors to keep the comparison
+    # fair; the baseline factories close over them.
+    q_f, k_f, v_f = _make_qkv(cfg, cfg.dtype, requires_grad=False)
+    q_g, k_g, v_g = _make_qkv(cfg, cfg.dtype, requires_grad=True)
+    mask = _make_mask(cfg)
+    fwd_fns = _methods(q_f, k_f, v_f, mask, cfg)
+    bwd_fns = _methods(q_g, k_g, v_g, mask, cfg)
+
+    # fp64 max-abs-err at the scaled-down shape, computed once.
+    print("[err] computing max abs error vs fp64 oracle (scaled-down shape)…")
+    errors = _measure_errors(cfg)
+    for label, err in errors.items():
+        shown = "n/a" if err is None else f"{err:.2e}"
+        print(f"[err] {label}: max|Δ_fp64| = {shown}")
+
     results: List[BenchResult] = []
+    labels = list(fwd_fns.keys())
+    for label in labels:
+        f_fwd = fwd_fns[label]
+        f_bwd = bwd_fns[label]
+        if f_fwd is None or f_bwd is None:
+            print(f"[skip] {label}: unavailable (likely torch<2.5)")
+            continue
+        print(f"[run ] {label}: fwd …")
+        try:
+            lat_fwd, peak_fwd = _measure(f_fwd, cfg.warmup_iters, cfg.measure_iters)
+        except torch.cuda.OutOfMemoryError:
+            print(f"[OOM ] {label} fwd — skipping both measurements")
+            continue
+        except Exception as e:  # noqa: BLE001
+            print(f"[fail] {label} fwd raised {type(e).__name__}: {e}")
+            continue
 
-    # ---- Triton path ----
-    tri_fn = _triton_fn(q, k, v, mask, cfg)
-    tri_lats, tri_peak = _measure(tri_fn, cfg.warmup_iters, cfg.measure_iters)
-    tri_bytes = _bytes_moved_triton(cfg, cfg.dtype, density)
-    tri_bw = tri_bytes / (statistics.median(tri_lats) * 1e-3) / 1e9
-    results.append(BenchResult(
-        label="triton-block-sparse",
-        dtype=str(cfg.dtype).replace("torch.", ""),
-        seq_len_kv=cfg.seq_len_kv,
-        density=density,
-        latency_p50_ms=statistics.median(tri_lats),
-        latency_p95_ms=_percentile(tri_lats, 95),
-        latency_p99_ms=_percentile(tri_lats, 99),
-        peak_vram_mib=tri_peak,
-        bytes_moved=tri_bytes,
-        bandwidth_gb_s=tri_bw,
-    ))
-    _profile_once(tri_fn, trace_dir / "triton.json", "triton")
+        p50_bwd: Optional[float] = None
+        p95_bwd: Optional[float] = None
+        peak_bwd: Optional[float] = None
+        try:
+            print(f"[run ] {label}: fwd+bwd …")
+            grad_out = torch.randn_like(f_bwd())
+            lat_bwd, peak_bwd = _measure_fwdbwd(
+                f_bwd, (q_g, k_g, v_g), grad_out,
+                cfg.warmup_iters, cfg.measure_iters,
+            )
+            p50_bwd = statistics.median(lat_bwd)
+            p95_bwd = _percentile(lat_bwd, 95)
+        except torch.cuda.OutOfMemoryError:
+            print(f"[OOM ] {label} fwd+bwd — reporting fwd only")
+        except Exception as e:  # noqa: BLE001
+            print(f"[fail] {label} fwd+bwd raised {type(e).__name__}: {e}")
 
-    # ---- Eager path (only if we fit) ----
-    oom = False
-    try:
-        eag_fn = _eager_fn(q, k, v, mask, cfg)
-        eag_lats, eag_peak = _measure(eag_fn, cfg.warmup_iters, cfg.measure_iters)
-        eag_bytes = _bytes_moved_eager(cfg, cfg.dtype)
-        eag_bw = eag_bytes / (statistics.median(eag_lats) * 1e-3) / 1e9
+        peak = max(peak_fwd, peak_bwd) if peak_bwd is not None else peak_fwd
         results.append(BenchResult(
-            label="eager-dense",
+            label=label,
             dtype=str(cfg.dtype).replace("torch.", ""),
             seq_len_kv=cfg.seq_len_kv,
-            density=1.0,
-            latency_p50_ms=statistics.median(eag_lats),
-            latency_p95_ms=_percentile(eag_lats, 95),
-            latency_p99_ms=_percentile(eag_lats, 99),
-            peak_vram_mib=eag_peak,
-            bytes_moved=eag_bytes,
-            bandwidth_gb_s=eag_bw,
+            density=density if "block-sparse" in label or "flex" in label else 1.0,
+            fwd_p50_ms=statistics.median(lat_fwd),
+            fwd_p95_ms=_percentile(lat_fwd, 95),
+            fwdbwd_p50_ms=p50_bwd,
+            fwdbwd_p95_ms=p95_bwd,
+            peak_vram_mib=peak,
+            max_abs_err_vs_fp64=errors.get(label),
         ))
-        _profile_once(eag_fn, trace_dir / "eager.json", "eager")
-    except torch.cuda.OutOfMemoryError:
-        oom = True
-        print(
-            "[eager] OOM at this sequence length — the N² scratch does not "
-            "fit, which is itself the headline result. Reporting Triton "
-            "numbers only."
-        )
 
-    _print_results(results, oom_eager=oom)
+    _print_results(results)
     _write_csv(results, Path("./bench_results.csv"))
     return 0
 
 
-def _percentile(values: Sequence[float], q: float) -> float:
-    s = sorted(values)
-    k = (len(s) - 1) * (q / 100.0)
-    lo = math.floor(k)
-    hi = math.ceil(k)
-    if lo == hi:
-        return s[int(k)]
-    return s[lo] + (s[hi] - s[lo]) * (k - lo)
-
-
-def _print_results(results: Sequence[BenchResult], *, oom_eager: bool) -> None:
+def _print_results(results: Sequence[BenchResult]) -> None:
     col_widths = [max(len(h), max((len(r.to_row()[i]) for r in results), default=0))
                   for i, h in enumerate(_HEADERS)]
     def _fmt(row: Sequence[str]) -> str:
@@ -550,15 +751,6 @@ def _print_results(results: Sequence[BenchResult], *, oom_eager: bool) -> None:
     for r in results:
         print(_fmt(r.to_row()))
     print()
-    if len(results) >= 2 and not oom_eager:
-        tri, eag = results[0], results[1]
-        print(
-            f"[summary] VRAM reduction: {eag.peak_vram_mib / tri.peak_vram_mib:.1f}×\n"
-            f"[summary] HBM traffic reduction: "
-            f"{eag.bytes_moved / tri.bytes_moved:.1f}×\n"
-            f"[summary] p95 latency speedup: "
-            f"{eag.latency_p95_ms / tri.latency_p95_ms:.1f}×"
-        )
 
 
 def _write_csv(results: Sequence[BenchResult], path: Path) -> None:

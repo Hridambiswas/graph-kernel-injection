@@ -22,3 +22,7 @@ bench_results.csv
 
 # triton cache
 .triton/
+
+# claude code harness
+.claude/settings.local.json
+.claude/scheduled_tasks.lock

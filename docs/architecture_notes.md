@@ -425,3 +425,75 @@ laptop GPU will run the defaults without pressure.
 Prompt 001 explicitly says "diagnosis only — do NOT fix anything yet",
 so this file ends here. Prompt 003 will fix H-1, H-2, M-2, M-3 and
 widen the FX pass to match SDPA.
+
+## 7. 2026-10-23 — Prompt 003 fix for H-1 and H-2
+
+### Cause (H-1 and H-2)
+
+`make_streaming_mask` keeps a block pair `(i, j)` if **any** token
+pair in that rectangle qualifies under the StreamingLLM mask. Inside
+a kept pair, cells with `k > q` (future tokens) can still be present
+— the construction is deliberately a *superset*. The forward and
+backward kernels previously masked only with the N_Q / N_KV bounds
+inside each visited block, so those "superset" cells participated in
+the softmax. The reference oracle `reference_block_sparse_attention`
+lifted the block mask back to token level by `repeat_interleave`,
+inheriting the same superset, so `gradcheck` was comparing the
+kernel against *the kernel's own wrong semantics*.
+
+### Fix (one targeted change per issue)
+
+- **H-1**: Each kernel now accepts an `IS_CAUSAL: tl.constexpr` and
+  the scalar runtime args `sink_size, window_size`. When `IS_CAUSAL`
+  is true, every visited block applies the token-level mask
+
+  ```
+  (k_pos < sink_size) | ((k_pos <= q_pos) & (k_pos >= q_pos - W + 1))
+  ```
+
+  on top of the existing bounds mask. The two backward kernels mirror
+  the forward kernel's construction. Change is contained to the
+  `_fwd_kernel`, `_bwd_dkdv_kernel` and `_bwd_dq_kernel` bodies plus
+  the autograd `apply` call sites.
+
+- **H-2**: `reference_block_sparse_attention` now takes the same
+  `(is_causal, sink_size, window_size)` kwargs and intersects the
+  lifted block mask with the token-level StreamingLLM mask. In
+  addition, a new helper `streaming_token_mask(...)` returns the
+  paper's token-level mask directly — independent of any block mask —
+  which lets tests compare *the kernel's effective mask* against *the
+  paper's definition* without going through the oracle.
+
+### CPU-runnable verification
+
+`tests/test_mask_equivalence.py` asserts, over nine
+(n_q, n_kv, sink, window, bm, bn) shapes, that the effective mask
+the kernel implements (`block_mask lifted ∩ in_block_token_mask`)
+equals the pure StreamingLLM token mask. It also carries a
+regression test showing that the pre-fix path (lifted block mask
+only) is strictly looser than the paper on at least one cell. 24
+tests passed on 2026-10-23 (CPU only; no Triton on this host).
+
+### What is still unconfirmed until the GPU run
+
+- That the Triton compiler lowers the new `IS_CAUSAL` branch
+  correctly on an SM 70+ laptop GPU. The Python-level mask formula
+  is proven equal to the paper; the kernel implementation is only
+  proven *by reading*.
+- M-2 (fully-masked-row → `-inf` lse → NaN gradient) is **not** fixed
+  here. A well-formed StreamingLLM mask with `sink_size >= 1` has no
+  empty rows, so this cannot fire for the configurations exercised
+  by the benchmark harness. If a user supplies a custom block mask
+  with an empty row they will still trip the bug; prompt 004 (not
+  yet written) can address this.
+- M-3 (silent fp64→fp32 fallback in `verify-grads`) is logged clearly
+  in stdout but still exits 0 whichever path runs. Not addressed by
+  prompt 003.
+
+### API change surface
+
+`block_sparse_attention(..., is_causal=False, sink_size=0, window_size=0)` —
+new kwargs, defaulted so dense callers see no behaviour change.
+`reference_block_sparse_attention(...)` — same three new kwargs.
+`streaming_token_mask(n_q, n_kv, sink_size, window_size, device)` —
+new public function used by tests. Added to `__all__`.
