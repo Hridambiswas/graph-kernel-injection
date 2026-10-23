@@ -296,18 +296,26 @@ def verify_gradients(cfg: HarnessConfig) -> int:
     _enable_strict_fp32()
 
     # --- 1 + 2. gradcheck + gradgradcheck under graceful fp64→fp32 fallback ---
-    # Per Gemini's architectural review: wrap the *entire* fp64 gradcheck call
-    # in try/except (not merely the probe). If fp64 matmul is unsupported, or
-    # if any step of the fp64 path raises for any reason, we degrade to the
-    # FlashAttention-2 fp32 protocol with no loss of audit evidence.
+    # If fp64 matmul is unsupported (common on consumer GPUs), we degrade to
+    # the FlashAttention-2 fp32 protocol. M-3 (prompt 004): make it explicit
+    # which tier ran so a reader of the log cannot miss that fp64 was
+    # skipped, and surface the result in the final summary.
+    fp64_ran = False
+    fp64_skip_reason: Optional[str] = None
     try:
         _run_gradchecks(cfg, torch.float64, eps=1e-6, atol=1e-5, rtol=1e-3)
         print("[gradcheck] ✓ fp64 strict path completed")
+        fp64_ran = True
     except Exception as e:
+        fp64_skip_reason = f"{type(e).__name__}: {e}"
+        print(f"FP64 GRADCHECK NOT RUN: {fp64_skip_reason}")
         print(
-            f"[gradcheck] fp64 path raised {type(e).__name__}: {e}; "
-            f"degrading to FA2 fp32 protocol (eps=1e-3, atol=5e-3, rtol=5e-3)"
+            "[gradcheck] degrading to FA2 fp32 protocol "
+            "(eps=1e-3, atol=5e-3, rtol=5e-3)"
         )
+        # NOTE: a failure here is NOT silently caught — it propagates out
+        # of verify_gradients() and the CLI exits non-zero, as required
+        # (M-3: exit nonzero if any check that ran fails).
         _run_gradchecks(cfg, torch.float32, eps=1e-3, atol=5e-3, rtol=5e-3)
         print("[gradcheck] ✓ fp32 FA2 fallback completed")
 
@@ -346,6 +354,10 @@ def verify_gradients(cfg: HarnessConfig) -> int:
         )
         assert ok, f"{name} does not match eager autograd"
 
+    print(
+        f"[summary] gradcheck.fp64_ran={fp64_ran}"
+        + (f"  (fp64 skip reason: {fp64_skip_reason})" if not fp64_ran else "")
+    )
     print("[verify] ✓ ALL correctness checks passed")
     return 0
 
