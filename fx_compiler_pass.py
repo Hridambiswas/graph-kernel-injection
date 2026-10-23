@@ -344,9 +344,19 @@ class BlockSparseAttentionInjector:
     # -- Mask materialisation ------------------------------------------------
 
     def _build_mask(self) -> torch.Tensor:
+        """Build the block mask lazily on CPU (prompt 004 L-3).
+
+        Previously the mask was allocated on ``cfg.device`` (default
+        ``"cuda"``) at injector-construction time, which blew up on a
+        CPU-only host. The buffer registered on ``_InjectedTritonAttention``
+        follows the containing module's ``.to(device)`` call, so
+        allocating on CPU here is sufficient: the user calls
+        ``fused.to("cuda")`` after ``.transform(...)`` and the mask
+        follows.
+        """
         if self.cfg.custom_mask is not None:
-            return self.cfg.custom_mask.to(
-                device=self.cfg.device, dtype=torch.int32
+            return self.cfg.custom_mask.detach().to(
+                device="cpu", dtype=torch.int32
             ).contiguous()
         if self.cfg.streaming is None:
             raise ValueError("Must supply either `streaming` or `custom_mask`")
@@ -354,7 +364,7 @@ class BlockSparseAttentionInjector:
             self.cfg.seq_len_q, self.cfg.seq_len_kv,
             self.cfg.streaming,
             self.cfg.block_m, self.cfg.block_n,
-            device=self.cfg.device,
+            device="cpu",
         )
 
     # -- Pattern matching ----------------------------------------------------
