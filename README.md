@@ -2,13 +2,17 @@
 
 ## Status
 
-**Not yet run on GPU.** All numeric claims in this README that refer
-to specific latencies, memory numbers, bandwidth or speedups are
-**analytical** — derived from the mask formula and vendor spec
-sheets — and are marked "not yet measured" below. The first hardware
-run is scheduled for 2026-10-23 via `scripts/gpu_run.sh`; after that,
-this section will be rewritten with the real numbers from
-`results/<timestamp>/bench_results.csv`.
+Kernel and FX pass implemented; **mask semantics verified by CPU
+tests** (58 cases under `tests/`, including a hand-written reference
+that calls no repo helper so a shared bug cannot hide). **NOT yet
+run on GPU, no performance numbers yet; GPU verification planned.**
+
+All numeric claims in this README that refer to specific latencies,
+memory numbers, bandwidth or speedups are **analytical** — derived
+from the mask formula and vendor spec sheets — and are marked "not
+yet measured" below. The next milestone is the first hardware run
+via `scripts/gpu_run.sh`; after that, this section will be rewritten
+with the real numbers from `results/<timestamp>/bench_results.csv`.
 
 Written with heavy AI assistance (Claude Code). **Hridam reviewed:**
 TODO. **Hridam verified:** TODO. The repo is a proof-of-work asset
@@ -204,9 +208,15 @@ tightest tier it can and prints which path it took:
 Any failure raises; the CLI exits non-zero and refuses to run the
 perf benchmark. The specific tier taken is printed in the log so a
 reader can tell whether fp64 was actually exercised or whether the
-fallback kicked in. In addition, 28 CPU-runnable unit tests under
-`tests/` cover the token-level mask equivalence (H-1 / H-2 fix) and
-the FX pass's SDPA matching — these do not require Triton or a GPU.
+fallback kicked in. The log line `FP64 GRADCHECK NOT RUN: <reason>`
+appears when the fp64 path is skipped, and the final summary line
+`[summary] gradcheck.fp64_ran=…` records which tier ran. In
+addition, 58 CPU-runnable unit tests under `tests/` cover the
+token-level mask equivalence (fixes for bugs A and B — sink future
+leak and bottom-right q alignment), the block mask superset
+condition on non-divisible shapes, the oracle vs a hand-written
+reference, and the FX pass's SDPA matching — these do not require
+Triton or a GPU.
 
 ## 6. Benchmarks
 
